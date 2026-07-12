@@ -37,6 +37,7 @@ DEFAULT_CONFIG = {
     "cloudflare_path_token": "/token",
     "cloudflare_path_messages": "/messages",
     "proxy": "http://127.0.0.1:7890",
+    "register_headless": False,
     "enable_nsfw": True,
     "register_count": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -634,12 +635,43 @@ CHROMIUM_SLIM_FLAGS = [
 ]
 
 
+def _config_bool(name: str, default: bool = False) -> bool:
+    value = config.get(name, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(default)
+
+
+def _apply_register_headless_options(options) -> bool:
+    """Apply optional headless mode for the registration browser."""
+    headless = _config_bool("register_headless", False)
+    if not headless:
+        try:
+            options.headless(False)
+        except Exception:
+            pass
+        return False
+
+    try:
+        options.headless(True)
+    except Exception:
+        options.set_argument("--headless=new")
+    options.set_argument("--window-size=1280,900")
+    print("  [browser] register_headless=true")
+    return True
+
+
 def create_browser_options():
     options = ChromiumOptions()
     options.auto_port()
     options.set_timeouts(base=1)
     for flag in CHROMIUM_SLIM_FLAGS:
         options.set_argument(flag)
+    _apply_register_headless_options(options)
     if os.path.exists(EXTENSION_PATH):
         options.add_extension(EXTENSION_PATH)
     # Apply config.json "proxy" to Chromium. Without this, only HTTP helpers
