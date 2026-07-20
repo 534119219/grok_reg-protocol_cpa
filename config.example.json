@@ -202,7 +202,7 @@
   "// cpa_mint_browser_recycle_every": "mint 浏览器每成功 N 次后完整重启；0=仅出错时重启",
   "cpa_mint_browser_recycle_every": 15,
   "// ===== CPA 号池巡检（WebUI） =====": "",
-  "// cpa_pool_auto_scan": "true=WebUI 后台按周期自动巡检 CPA auth 文件；默认 false，建议先手动全量跑通",
+  "// cpa_pool_auto_scan": "true=WebUI 后台按周期自动巡检 CPA auth 文件；计划时间和运行中任务会持久化，服务重启后续跑；默认 false",
   "cpa_pool_auto_scan": false,
   "// cpa_pool_scan_interval_sec": "自动巡检周期（秒）；24h 填 86400",
   "cpa_pool_scan_interval_sec": 300,

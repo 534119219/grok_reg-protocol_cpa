@@ -648,13 +648,14 @@ function renderCpaPoolStatus() {
   const settings = data.settings || {};
   const refill = s.refill || {};
   const running = Boolean(data.running);
+  const resumed = running && Boolean(data.resumed);
   const total = Number(data.cpa_total ?? s.total ?? 0);
   const done = Number(progress.done ?? s.done ?? 0);
   const scanTotal = Number(progress.total ?? s.total ?? 0);
   const pct = scanTotal ? Math.min(100, (done / scanTotal) * 100) : 0;
 
   $("#cpa-pool-state").className = `pill ${running ? "running" : (s.finished_at || data.finished_at ? "completed" : "idle")}`;
-  $("#cpa-pool-state").textContent = running ? "巡检中" : (s.finished_at || data.finished_at ? "已完成" : "未巡检");
+  $("#cpa-pool-state").textContent = running ? (resumed ? "恢复巡检中" : "巡检中") : (s.finished_at || data.finished_at ? "已完成" : "未巡检");
   $("#cpa-pool-stop").disabled = !running;
   $("#cpa-pool-scan").disabled = running;
   $("#cpa-pool-total").textContent = total;
@@ -668,7 +669,9 @@ function renderCpaPoolStatus() {
     ? (refill.started ? `+${refill.limit || refill.need || 0}` : (refill.need ? `待${refill.need}` : "ON"))
     : (settings.auto_refill ? "ON" : "OFF");
   $("#cpa-pool-progress").style.width = `${pct}%`;
-  const next = data.next_scan_in_sec != null ? `${data.next_scan_in_sec}s` : "-";
+  const next = data.next_scan_at_display
+    ? `${data.next_scan_at_display} (${data.next_scan_in_sec || 0}s)`
+    : (data.next_scan_in_sec != null ? `${data.next_scan_in_sec}s` : "-");
   const elapsed = s.elapsed_sec != null ? ` · 耗时 ${s.elapsed_sec}s` : "";
   const actions = s.actions ? Object.entries(s.actions).map(([k, v]) => `${k}:${v}`).join(" ") : "";
   const refillSkip = refill.error ? `skip ${refill.error}` : `need=${refill.need || 0}`;
@@ -676,6 +679,9 @@ function renderCpaPoolStatus() {
     ? (refill.started
       ? ` · 补号 <code>started need=${esc(refill.need || 0)} limit=${esc(refill.limit || 0)} excluded=${esc(refill.excluded || 0)}</code>`
       : ` · 补号 <code>${esc(refillSkip)}</code>`)
+    : "";
+  const resumeMeta = Number(data.resume_count || s.resume_count || 0) > 0
+    ? ` · 任务恢复 <code>${esc(data.resume_count || s.resume_count)}次</code>`
     : "";
   $("#cpa-pool-meta").innerHTML =
     `进度 <b>${done}/${scanTotal || total}</b>${elapsed} · 下次自动检查 ${esc(next)} · ` +
@@ -685,6 +691,7 @@ function renderCpaPoolStatus() {
     `治理 <code>${settings.apply_policy ? "ON" : "OFF"}</code> · ` +
     `自动补号 <code>${settings.auto_refill ? "ON" : "OFF"}</code>` +
     (actions ? ` · 动作 <code>${esc(actions)}</code>` : "") +
+    resumeMeta +
     refillMeta;
 
   const logs = data.logs || [];
@@ -754,7 +761,7 @@ function renderCpaScanHistory() {
       : "-";
     tr.innerHTML = `
       <td><span class="pill ${cpaScanOutcomePill(row.outcome)}">${esc(scanOutcomeText[row.outcome] || row.outcome || "-")}</span></td>
-      <td><span class="mono" title="${esc(row.id || "")}">${esc(row.finished_at || row.started_at || "-")}</span><small class="table-sub">${esc(row.trigger || "manual")}</small></td>
+      <td><span class="mono" title="${esc(row.id || "")}">${esc(row.finished_at || row.started_at || "-")}</span><small class="table-sub">${esc(row.trigger || "manual")}${row.resume_count ? ` · 恢复 ${esc(row.resume_count)}次` : ""}</small></td>
       <td><span class="mono">${esc(row.done ?? 0)}/${esc(row.total ?? 0)}</span><small class="table-sub">耗时 ${esc(row.elapsed_sec ?? "-")}s</small></td>
       <td><div class="mini-counts"><span class="ok">OK ${esc(row.ok || 0)}</span><span class="warn">额度 ${esc(row.quota || 0)}</span><span class="err">异常 ${esc(row.bad || 0)}</span></div></td>
       <td><span class="mono" title="${esc(counts)}">${esc(actions || "-")}</span><small class="table-sub">续期 ${esc(row.refreshed || 0)} · 恢复 ${esc(row.reenabled || 0)}</small></td>
