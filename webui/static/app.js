@@ -22,6 +22,10 @@ const state = {
   selectedCpa: new Set(),
   cpaPool: null,
   cpaPoolMap: new Map(),
+  cpaScanHistory: [],
+  cpaScanHistoryTotal: 0,
+  cpaScanHistoryQuery: "",
+  cpaScanHistoryOutcome: "all",
   cpaQuarantine: [],
   cpaQuarantineQuery: "",
   cpaQuarantineBucket: "all",
@@ -96,6 +100,21 @@ function cpaPoolPill(status) {
   if (status === "running") return "running";
   if (!status) return "idle";
   return "err";
+}
+
+const scanOutcomeText = {
+  ok: "正常",
+  warn: "有异常",
+  error: "执行异常",
+  cancelled: "已取消",
+};
+
+function cpaScanOutcomePill(outcome) {
+  if (outcome === "ok") return "ok";
+  if (outcome === "warn") return "warn";
+  if (outcome === "cancelled") return "idle";
+  if (outcome === "error") return "err";
+  return "idle";
 }
 
 const kindText = {
@@ -198,6 +217,7 @@ const CONFIG_FIELDS = {
     ["cpa_pool_max_items_per_scan", "单轮最多巡检(0全量)", "number"],
     ["cpa_pool_probe_proxy", "号池 probe 代理(direct/pool)", "proxy"],
     ["cpa_pool_history_limit", "每号巡检历史条数", "number"],
+    ["cpa_pool_scan_history_limit", "整轮巡检历史条数", "number"],
     ["cpa_pool_apply_policy", "号池自动治理", "bool"],
     ["cpa_pool_auto_refill", "号池自动补 CPA", "bool"],
     ["cpa_pool_refill_target_active", "补 CPA 目标存量(0保持巡检前)", "number"],
@@ -609,6 +629,7 @@ async function loadCpa() {
     api(`/api/cpa?${params}`),
     loadCpaPoolStatus().catch(() => null),
     loadCpaPoolResults().catch(() => null),
+    loadCpaScanHistory().catch(() => null),
     loadCpaQuarantine().catch(() => null),
   ]);
   state.cpa = data.items || [];
@@ -705,6 +726,55 @@ async function loadCpaPoolStatus() {
 async function loadCpaPoolResults() {
   const data = await api("/api/cpa/pool/results?page_size=10000");
   state.cpaPoolMap = new Map((data.items || []).map((r) => [String(r.email || "").toLowerCase(), r]));
+  return data;
+}
+
+function compactObj(obj) {
+  return Object.entries(obj || {})
+    .filter(([, v]) => Number(v || 0) !== 0)
+    .map(([k, v]) => `${k}:${v}`)
+    .join(" ");
+}
+
+function renderCpaScanHistory() {
+  const tbody = $("#cpa-scan-history-rows");
+  if (!tbody) return;
+  tbody.innerHTML = "";
+  const items = state.cpaScanHistory || [];
+  $("#cpa-scan-history-empty").hidden = items.length > 0;
+  $("#cpa-scan-history-count").textContent =
+    state.cpaScanHistoryTotal > items.length ? `最近 ${items.length} / 共 ${state.cpaScanHistoryTotal} 条` : `${items.length} 条`;
+  for (const row of items) {
+    const tr = document.createElement("tr");
+    const actions = compactObj(row.actions);
+    const counts = compactObj(row.counts);
+    const refill = row.refill || {};
+    const refillText = refill.enabled
+      ? (refill.started ? `补 ${refill.limit || refill.need || 0}` : (refill.need ? `待补 ${refill.need}` : "开启"))
+      : "-";
+    tr.innerHTML = `
+      <td><span class="pill ${cpaScanOutcomePill(row.outcome)}">${esc(scanOutcomeText[row.outcome] || row.outcome || "-")}</span></td>
+      <td><span class="mono" title="${esc(row.id || "")}">${esc(row.finished_at || row.started_at || "-")}</span><small class="table-sub">${esc(row.trigger || "manual")}</small></td>
+      <td><span class="mono">${esc(row.done ?? 0)}/${esc(row.total ?? 0)}</span><small class="table-sub">耗时 ${esc(row.elapsed_sec ?? "-")}s</small></td>
+      <td><div class="mini-counts"><span class="ok">OK ${esc(row.ok || 0)}</span><span class="warn">额度 ${esc(row.quota || 0)}</span><span class="err">异常 ${esc(row.bad || 0)}</span></div></td>
+      <td><span class="mono" title="${esc(counts)}">${esc(actions || "-")}</span><small class="table-sub">续期 ${esc(row.refreshed || 0)} · 恢复 ${esc(row.reenabled || 0)}</small></td>
+      <td><span class="mono">${esc(refillText)}</span><small class="table-sub">CPA ${esc(row.cpa_total || 0)} · 隔离 ${esc(row.quarantine_total || 0)}</small></td>
+      <td><span class="mono">${esc(row.proxy || "direct")}</span><small class="table-sub">并发 ${esc(row.scan_workers || "-")} · chat ${row.probe_chat ? "ON" : "OFF"}</small></td>
+    `;
+    tbody.append(tr);
+  }
+}
+
+async function loadCpaScanHistory() {
+  const params = new URLSearchParams({
+    query: state.cpaScanHistoryQuery,
+    outcome: state.cpaScanHistoryOutcome,
+    page_size: "20",
+  });
+  const data = await api(`/api/cpa/pool/history?${params}`);
+  state.cpaScanHistory = data.items || [];
+  state.cpaScanHistoryTotal = data.total || 0;
+  renderCpaScanHistory();
   return data;
 }
 
@@ -1089,7 +1159,7 @@ const PAGE_SETTINGS = {
     groups: [
       ["CPA 导出", ["cpa_export_enabled", "cpa_prefer_protocol", "cpa_protocol_flow", "cpa_protocol_only", "cpa_allow_device_flow_fallback", "cpa_auth_dir", "cpa_copy_to_hotload", "cpa_hotload_dir", "cpa_base_url"]],
       ["Mint 执行", ["cpa_headless", "cpa_force_standalone", "cpa_mint_workers", "cpa_mint_queue_max", "cpa_mint_timeout_sec", "cpa_mint_cookie_inject", "cpa_gui_close_mint_browser", "cpa_mint_browser_reuse", "cpa_mint_browser_recycle_every", "cpa_probe_after_write", "cpa_probe_chat", "cpa_protocol_poll_timeout_sec"]],
-      ["号池巡检", ["cpa_pool_auto_scan", "cpa_pool_scan_interval_sec", "cpa_pool_scan_workers", "cpa_pool_probe_timeout_sec", "cpa_pool_probe_chat", "cpa_pool_refresh_before_probe", "cpa_pool_refresh_skew_sec", "cpa_pool_max_items_per_scan", "cpa_pool_probe_proxy", "cpa_pool_history_limit"]],
+      ["号池巡检", ["cpa_pool_auto_scan", "cpa_pool_scan_interval_sec", "cpa_pool_scan_workers", "cpa_pool_probe_timeout_sec", "cpa_pool_probe_chat", "cpa_pool_refresh_before_probe", "cpa_pool_refresh_skew_sec", "cpa_pool_max_items_per_scan", "cpa_pool_probe_proxy", "cpa_pool_history_limit", "cpa_pool_scan_history_limit"]],
       ["号池治理与补号", ["cpa_pool_apply_policy", "cpa_pool_auto_refill", "cpa_pool_refill_target_active", "cpa_pool_refill_max_per_scan", "cpa_pool_refill_workers", "cpa_pool_refill_probe_chat", "cpa_pool_quarantine_dir", "cpa_pool_move_with_backup", "cpa_pool_hard_bad_threshold", "cpa_pool_refresh_failed_threshold", "cpa_pool_invalid_threshold", "cpa_pool_no_grok45_threshold", "cpa_pool_soft_fail_threshold", "cpa_pool_quota_threshold", "cpa_pool_quota_cooldown_sec", "cpa_pool_hard_bad_action", "cpa_pool_refresh_failed_action", "cpa_pool_invalid_action", "cpa_pool_no_grok45_action", "cpa_pool_soft_fail_action", "cpa_pool_quota_action"]],
     ],
   },
@@ -1366,6 +1436,7 @@ async function pollActiveJob() {
       const status = await loadCpaPoolStatus().catch(() => null);
       if (beforeRunning && status && !status.running) {
         await loadCpaPoolResults().catch(() => {});
+        await loadCpaScanHistory().catch(() => {});
         await loadCpaQuarantine().catch(() => {});
         renderCpa();
       }
@@ -1660,8 +1731,19 @@ function bindEvents() {
   $("#cpa-pool-refresh-status").addEventListener("click", async () => {
     await loadCpaPoolStatus().catch((e) => toast(e.message, true));
     await loadCpaPoolResults().catch(() => {});
+    await loadCpaScanHistory().catch(() => {});
     await loadCpaQuarantine().catch(() => {});
     renderCpa();
+  });
+  $("#refresh-cpa-scan-history").addEventListener("click", () =>
+    loadCpaScanHistory().catch((e) => toast(e.message, true)));
+  $("#cpa-scan-history-search").addEventListener("input", debounce((e) => {
+    state.cpaScanHistoryQuery = e.target.value.trim();
+    loadCpaScanHistory().catch((err) => toast(err.message, true));
+  }));
+  $("#cpa-scan-history-outcome").addEventListener("change", (e) => {
+    state.cpaScanHistoryOutcome = e.target.value;
+    loadCpaScanHistory().catch((err) => toast(err.message, true));
   });
   $("#cpa-pool-scan").addEventListener("click", async () => {
     const body = {

@@ -222,6 +222,8 @@
   "cpa_pool_probe_proxy": "direct",
   "// cpa_pool_history_limit": "每个账号保留最近 N 次巡检摘要，0=不保留",
   "cpa_pool_history_limit": 8,
+  "// cpa_pool_scan_history_limit": "保存最近 N 次整轮巡检概览记录，0=不保存",
+  "cpa_pool_scan_history_limit": 100,
   "// cpa_pool_apply_policy": "true=巡检后按下面策略自动治理；默认 false，建议先只读巡检观察分布",
   "cpa_pool_apply_policy": false,
   "// cpa_pool_auto_refill": "true=治理移动/隔离导致活跃 CPA 数低于目标时，自动启动 WebUI 补 CPA 任务；默认 false",

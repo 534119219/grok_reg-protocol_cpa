@@ -13,6 +13,7 @@ import random
 import shutil
 import threading
 import time
+import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -47,6 +48,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "probe_proxy": "direct",  # direct | pool:random | proxy URL
     # state/history
     "history_limit": 8,
+    "scan_history_limit": 100,
     # governance switch; off by default for safe rollout
     "apply_policy": False,
     "quarantine_dir": str(DEFAULT_QUARANTINE_DIR),
@@ -324,6 +326,7 @@ def settings_from_config(config: dict[str, Any] | None = None) -> dict[str, Any]
             "max_items_per_scan": _coerce_int(cfg.get("cpa_pool_max_items_per_scan"), int(s["max_items_per_scan"]), min_v=0, max_v=100000),
             "probe_proxy": str(cfg.get("cpa_pool_probe_proxy") or "direct").strip(),
             "history_limit": _coerce_int(cfg.get("cpa_pool_history_limit"), int(s["history_limit"]), min_v=0, max_v=100),
+            "scan_history_limit": _coerce_int(cfg.get("cpa_pool_scan_history_limit"), int(s["scan_history_limit"]), min_v=0, max_v=1000),
             "apply_policy": _coerce_bool(cfg.get("cpa_pool_apply_policy"), bool(s["apply_policy"])),
             "quarantine_dir": str(cfg.get("cpa_pool_quarantine_dir") or s["quarantine_dir"]).strip(),
             "move_with_backup": _coerce_bool(cfg.get("cpa_pool_move_with_backup"), bool(s["move_with_backup"])),
@@ -452,6 +455,8 @@ class CpaPoolMonitor:
         self._scheduler_stop = threading.Event()
         self._settings = dict(DEFAULT_SETTINGS)
         self._summary: dict[str, Any] = {}
+        self._scan_history: list[dict[str, Any]] = []
+        self._scan_id = ""
         self._progress: dict[str, Any] = {"done": 0, "total": 0}
         self._started_at = ""
         self._finished_at = ""
@@ -478,13 +483,21 @@ class CpaPoolMonitor:
                 self._results = {str(k).lower(): _beijingize_record(dict(v)) for k, v in results.items() if isinstance(v, dict)}
             if isinstance(data.get("summary"), dict):
                 self._summary = _beijingize_record(dict(data["summary"]))
+            history = data.get("scan_history") or []
+            if isinstance(history, list):
+                self._scan_history = [_beijingize_record(dict(item)) for item in history if isinstance(item, dict)]
             self._finished_at = timeutil.iso_to_beijing_display(data.get("finished_at")) if data.get("finished_at") else ""
         except Exception:
             return
 
     def _save_state(self) -> None:
         with self._lock:
-            payload = {"finished_at": self._finished_at, "summary": dict(self._summary), "results": {k: dict(v) for k, v in self._results.items()}}
+            payload = {
+                "finished_at": self._finished_at,
+                "summary": dict(self._summary),
+                "scan_history": [dict(v) for v in self._scan_history],
+                "results": {k: dict(v) for k, v in self._results.items()},
+            }
         try:
             tmp = STATE_PATH.with_name(f".{STATE_PATH.name}.tmp")
             tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -540,6 +553,7 @@ class CpaPoolMonitor:
             last_error = self._last_error
             next_scan_at = self._next_scan_at
             results_total = len(self._results)
+            scan_history_total = len(self._scan_history)
         try:
             cpa_total = len(store.list_cpa_index())
         except Exception:
@@ -563,6 +577,7 @@ class CpaPoolMonitor:
             "cpa_total": cpa_total,
             "quarantine_total": q_total,
             "results_total": results_total,
+            "scan_history_total": scan_history_total,
             "ok": ok,
             "quota": quota,
             "bad": bad,
@@ -640,6 +655,7 @@ class CpaPoolMonitor:
                 return {"started": False, "running": True, "status": self.status()}
             self._running = True
             self._cancel.clear()
+            self._scan_id = uuid.uuid4().hex[:10]
             self._started_at = _utc_now()
             self._finished_at = ""
             self._last_error = ""
@@ -1012,8 +1028,109 @@ class CpaPoolMonitor:
             self._log(f"自动补号启动失败：need={need} error={err}")
             return {"enabled": True, "started": False, "target": target, "current": current_total, "need": need, "error": err}
 
+    def _scan_outcome(self, record: dict[str, Any]) -> str:
+        if record.get("error"):
+            return "error"
+        if record.get("cancelled"):
+            return "cancelled"
+        bad = int(record.get("bad") or 0)
+        actions = record.get("actions") or {}
+        refill = record.get("refill") or {}
+        if bad or actions or refill.get("started") or refill.get("error"):
+            return "warn"
+        return "ok"
+
+    def _append_scan_history(self, *, settings: dict[str, Any]) -> None:
+        with self._lock:
+            summary = _beijingize_record(dict(self._summary))
+            scan_id = self._scan_id or uuid.uuid4().hex[:10]
+            started_at = timeutil.iso_to_beijing_display(self._started_at) if self._started_at else str(summary.get("started_at") or "")
+            finished_at = timeutil.iso_to_beijing_display(self._finished_at) if self._finished_at else str(summary.get("finished_at") or "")
+            progress = dict(self._progress)
+            last_error = self._last_error
+            cancelled = self._cancel.is_set()
+        counts = dict(summary.get("counts") or {})
+        actions = dict(summary.get("actions") or {})
+        ok = int(counts.get("ok") or 0)
+        quota = int(counts.get("quota") or 0) + int(counts.get("cooling") or 0)
+        bad = sum(int(v or 0) for k, v in counts.items() if k not in {"ok", "quota", "cooling"})
+        try:
+            cpa_total = len(store.list_cpa_index())
+        except Exception:
+            cpa_total = 0
+        try:
+            quarantine_total = int(self.quarantine_summary().get("total") or 0)
+        except Exception:
+            quarantine_total = 0
+        refill = dict(summary.get("refill") or {})
+        record = {
+            "id": scan_id,
+            "trigger": summary.get("trigger") or "manual",
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "elapsed_sec": summary.get("elapsed_sec"),
+            "total": int(summary.get("total") or progress.get("total") or 0),
+            "done": int(summary.get("done") or progress.get("done") or 0),
+            "ok": ok,
+            "quota": quota,
+            "bad": bad,
+            "counts": counts,
+            "actions": actions,
+            "refreshed": int(summary.get("refreshed") or 0),
+            "reenabled": int(summary.get("reenabled") or 0),
+            "refill": refill,
+            "cpa_total": cpa_total,
+            "quarantine_total": quarantine_total,
+            "proxy": settings.get("probe_proxy") or "direct",
+            "probe_chat": bool(settings.get("probe_chat")),
+            "refresh_before_probe": bool(settings.get("refresh_before_probe")),
+            "apply_policy": bool(settings.get("apply_policy")),
+            "auto_refill": bool(settings.get("auto_refill")),
+            "scan_workers": int(settings.get("scan_workers") or 0),
+            "limit": int(settings.get("max_items_per_scan") or 0),
+            "cancelled": cancelled or bool(refill.get("cancelled")),
+            "error": last_error,
+        }
+        record["outcome"] = self._scan_outcome(record)
+        limit = _coerce_int(settings.get("scan_history_limit"), 100, min_v=0, max_v=1000)
+        with self._lock:
+            existing = [r for r in self._scan_history if str(r.get("id") or "") != scan_id]
+            existing.append(record)
+            self._scan_history = existing[-limit:] if limit > 0 else []
+
+    def list_scan_history(self, *, query: str = "", outcome: str = "all", page: int = 1, page_size: int = 50) -> dict[str, Any]:
+        q = query.strip().lower()
+        oc = outcome.strip().lower()
+        with self._lock:
+            items = [_beijingize_record(dict(v)) for v in self._scan_history]
+        if q:
+            items = [
+                i for i in items
+                if q in str(i.get("id") or "").lower()
+                or q in str(i.get("trigger") or "").lower()
+                or q in str(i.get("error") or "").lower()
+                or q in json.dumps(i.get("counts") or {}, ensure_ascii=False).lower()
+            ]
+        if oc and oc != "all":
+            items = [i for i in items if str(i.get("outcome") or "").lower() == oc]
+        items.sort(key=lambda i: str(i.get("finished_at") or i.get("started_at") or ""), reverse=True)
+        total = len(items)
+        page = max(1, int(page or 1))
+        page_size = max(1, min(int(page_size or 50), 1000))
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        if page > total_pages:
+            page = total_pages
+        start = (page - 1) * page_size
+        return {"items": items[start : start + page_size], "total": total, "page": page, "page_size": page_size, "total_pages": total_pages}
+
     def export_report(self) -> dict[str, Any]:
-        return {"generated_at": _utc_now(), "status": self.status(), "results": self.list_results(page_size=10000).get("items", []), "quarantine": self.list_quarantine(page_size=10000).get("items", [])}
+        return {
+            "generated_at": _utc_now(),
+            "status": self.status(),
+            "history": self.list_scan_history(page_size=1000).get("items", []),
+            "results": self.list_results(page_size=10000).get("items", []),
+            "quarantine": self.list_quarantine(page_size=10000).get("items", []),
+        }
 
     def _run_scan(self, options: dict[str, Any]) -> None:
         started = time.monotonic()
@@ -1033,6 +1150,7 @@ class CpaPoolMonitor:
         settings["refill_max_per_scan"] = _coerce_int(settings.get("refill_max_per_scan"), 30, min_v=1, max_v=10000)
         settings["refill_workers"] = _coerce_int(settings.get("refill_workers"), -1, min_v=-1, max_v=20)
         settings["refill_probe_chat"] = _coerce_bool(settings.get("refill_probe_chat"), False)
+        settings["scan_history_limit"] = _coerce_int(settings.get("scan_history_limit"), 100, min_v=0, max_v=1000)
         trigger = str(options.get("trigger") or "manual")
         self._settings = settings
         self._log(f"CPA 巡检开始：trigger={trigger} workers={settings['scan_workers']} probe_chat={settings['probe_chat']} refresh={settings['refresh_before_probe']} proxy={settings.get('probe_proxy')} policy={settings.get('apply_policy')}")
@@ -1121,6 +1239,7 @@ class CpaPoolMonitor:
                 self._progress["done"] = self._progress.get("done") or self._summary.get("done") or 0
                 interval = int(self._settings.get("scan_interval_sec") or 300)
                 self._next_scan_at = time.time() + interval
+            self._append_scan_history(settings=self._settings)
             self._save_state()
 
 

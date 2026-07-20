@@ -388,6 +388,9 @@ h2 { margin: 0; font-size: 14.5px; font-weight: 650; }
   height: 150px;
   margin: 0;
 }
+.scan-history-wrap {
+  min-height: 180px;
+}
 .quarantine-wrap {
   min-height: 220px;
 }
@@ -411,6 +414,24 @@ h2 { margin: 0; font-size: 14.5px; font-weight: 650; }
   min-height: 20px;
   padding: 0 7px;
 }
+.table-sub {
+  display: block;
+  margin-top: 4px;
+  color: var(--faint);
+  font-size: 11px;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+.mini-counts {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+.mini-counts .ok { color: var(--ok); }
+.mini-counts .warn { color: var(--warn); }
+.mini-counts .err { color: var(--err); }
 
 .chip {
   display: inline-flex; align-items: center; gap: 6px;
@@ -808,6 +829,7 @@ td .mono { color: var(--muted); font-size: 11.5px; }
 }
 .empty svg { width: 34px; height: 34px; margin-bottom: 8px; opacity: 0.5; color: var(--view, var(--violet)); }
 .empty strong { color: var(--muted); font-size: 14.5px; }
+.empty.compact { min-height: 180px; }
 
 .table-foot {
   display: flex; align-items: center; justify-content: space-between;

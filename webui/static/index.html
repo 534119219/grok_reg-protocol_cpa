@@ -488,6 +488,50 @@
           </div>
         </div>
 
+        <div class="panel scan-history-panel">
+          <div class="panel-head">
+            <h2><svg><use href="#i-history"/></svg>巡检历史</h2>
+            <span class="hint" id="cpa-scan-history-count">0 条</span>
+          </div>
+          <div class="toolbar">
+            <div class="search">
+              <svg><use href="#i-search"/></svg>
+              <input id="cpa-scan-history-search" type="search" placeholder="搜索巡检ID / 触发来源 / 结果…" autocomplete="off">
+            </div>
+            <select id="cpa-scan-history-outcome" class="select">
+              <option value="all">全部结果</option>
+              <option value="ok">正常</option>
+              <option value="warn">有异常</option>
+              <option value="error">执行异常</option>
+              <option value="cancelled">已取消</option>
+            </select>
+            <button class="btn ghost" id="refresh-cpa-scan-history" type="button">
+              <svg><use href="#i-refresh"/></svg>刷新历史
+            </button>
+          </div>
+          <div class="table-wrap scan-history-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>结果</th>
+                  <th>完成时间</th>
+                  <th>进度/耗时</th>
+                  <th>结果统计</th>
+                  <th>治理</th>
+                  <th>补号/存量</th>
+                  <th>配置</th>
+                </tr>
+              </thead>
+              <tbody id="cpa-scan-history-rows"></tbody>
+            </table>
+            <div class="empty compact" id="cpa-scan-history-empty" hidden>
+              <svg><use href="#i-history"/></svg>
+              <strong>暂无巡检历史</strong>
+              <span>手动巡检或 24h 自动巡检完成后会在这里保存概览</span>
+            </div>
+          </div>
+        </div>
+
         <div class="panel">
           <div class="toolbar">
             <div class="search">

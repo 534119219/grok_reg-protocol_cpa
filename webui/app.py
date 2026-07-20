@@ -199,6 +199,20 @@ def create_app() -> FastAPI:
             page_size=page_size,
         )
 
+    @app.get("/api/cpa/pool/history")
+    def cpa_pool_history(
+        query: str = "",
+        outcome: str = "all",
+        page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=1000),
+    ) -> dict[str, Any]:
+        return cpa_pool_monitor.list_scan_history(
+            query=query,
+            outcome=outcome,
+            page=page,
+            page_size=page_size,
+        )
+
     @app.post("/api/cpa/pool/scan")
     async def cpa_pool_scan(request: Request) -> JSONResponse:
         raw = await request.body()
