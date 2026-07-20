@@ -1,4 +1,4 @@
-/* 统一三选一视图切换器:原始(/classic) / Soft UI(/) / 漫画(/?theme=comic)。
+/* 统一三选一视图切换器:原始(/) / Soft UI(/dash) / 漫画(/dash?theme=comic)。
    - 新看板 dash.html:填充内联 #viewSwitch,Soft↔漫画 同页换 data-theme。
    - 原始 index.html:app.py 注入本脚本,这里自建一个浮动切换器(自带样式,不依赖 dash.css)。
    选择持久化在 localStorage(apc_view / apc_theme),刷新保持。 */
@@ -20,7 +20,7 @@
   }
   function go(view) {
     if (view === currentView()) return;
-    if (view === "classic") { persist("classic"); location.href = "/classic"; return; }
+    if (view === "classic") { persist("classic"); location.href = "/"; return; }
     if (IS_DASH) {
       document.documentElement.setAttribute("data-theme", view);
       persist(view);
@@ -28,7 +28,7 @@
       if (typeof window.__apcOnTheme === "function") window.__apcOnTheme(view);
     } else {
       persist(view);
-      location.href = "/?theme=" + view;
+      location.href = "/dash?theme=" + view;
     }
   }
   function buildInto(box) {

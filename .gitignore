@@ -19,6 +19,7 @@ proxies.txt
 proxies_state.json
 mail_credentials.txt
 cpa_pool_state.json
+.cpa_pool_state.json.tmp
 cpa_quarantine/
 cpa_auths/
 cookies/

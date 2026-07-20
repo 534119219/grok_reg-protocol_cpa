@@ -552,7 +552,13 @@ def create_app() -> FastAPI:
 
     @app.get("/")
     def index():
-        # 新看板(Soft UI 默认 / 漫画,同 DOM 换主题)。原始 UI 保留在 /classic。
+        return FileResponse(
+            STATIC_DIR / "index.html",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    @app.get("/dash")
+    def dashboard():
         return FileResponse(
             STATIC_DIR / "dash.html",
             headers={"Cache-Control": "no-cache"},
@@ -560,8 +566,7 @@ def create_app() -> FastAPI:
 
     @app.get("/classic")
     def classic():
-        # 原始 UI —— static/index.html 文件零改动;仅在响应时注入统一视图切换器脚本,
-        # 让原始视图也能一键切回 Soft UI / 漫画。
+        # Compatibility alias retained for links created while the dashboard lived at /.
         html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
         inject = '<script src="/assets/view-switch.js" defer></script>'
         if inject not in html:
