@@ -34,6 +34,7 @@ from . import timeutil
 
 STATE_PATH = store.ROOT / "cpa_pool_state.json"
 DEFAULT_QUARANTINE_DIR = store.ROOT / "cpa_quarantine"
+STATE_VERSION = 2
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     # scan
@@ -106,6 +107,7 @@ _PRESENTATION_TIME_KEYS = {
     "first_seen_at",
     "action_at",
     "cool_until",
+    "resumed_at",
 }
 
 
@@ -446,6 +448,7 @@ def _beijingize_record(row: dict[str, Any]) -> dict[str, Any]:
 class CpaPoolMonitor:
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        self._state_write_lock = threading.Lock()
         self._results: dict[str, dict[str, Any]] = {}
         self._logs: deque[str] = deque(maxlen=1600)
         self._running = False
@@ -460,14 +463,48 @@ class CpaPoolMonitor:
         self._progress: dict[str, Any] = {"done": 0, "total": 0}
         self._started_at = ""
         self._finished_at = ""
+        self._last_finished_ts = 0.0
         self._last_error = ""
         self._next_scan_at = 0.0
+        self._scheduled_interval_sec = 0
+        self._active_scan: dict[str, Any] = {}
+        self._recovery_pending = False
+        self._resume_count = 0
+        self._resumed_at = ""
         self._load_state()
 
     def _log(self, message: str) -> None:
         line = f"[{timeutil.now_clock()}] {str(message).rstrip()}"
         with self._lock:
             self._logs.append(line)
+
+    def _elapsed_sec(self, *, fallback_started: float | None = None) -> float:
+        started_ts = _iso_to_ts(self._started_at)
+        if started_ts > 0:
+            return round(max(0.0, time.time() - started_ts), 2)
+        if fallback_started is not None:
+            return round(max(0.0, time.monotonic() - fallback_started), 2)
+        return 0.0
+
+    def _effective_scan_settings(self, options: dict[str, Any]) -> dict[str, Any]:
+        settings = settings_from_config()
+        for key in DEFAULT_SETTINGS:
+            if key in options:
+                settings[key] = options[key]
+        settings["scan_workers"] = _coerce_int(settings.get("scan_workers"), 16, min_v=1, max_v=100)
+        settings["probe_timeout_sec"] = _coerce_float(settings.get("probe_timeout_sec"), 30.0, min_v=3.0, max_v=180.0)
+        settings["probe_chat"] = _coerce_bool(settings.get("probe_chat"), False)
+        settings["refresh_before_probe"] = _coerce_bool(settings.get("refresh_before_probe"), True)
+        settings["apply_policy"] = _coerce_bool(settings.get("apply_policy"), False)
+        settings["auto_refill"] = _coerce_bool(settings.get("auto_refill"), False)
+        settings["refresh_skew_sec"] = _coerce_int(settings.get("refresh_skew_sec"), 2700, min_v=0, max_v=86400)
+        settings["max_items_per_scan"] = _coerce_int(settings.get("max_items_per_scan"), 0, min_v=0, max_v=100000)
+        settings["refill_target_active"] = _coerce_int(settings.get("refill_target_active"), 0, min_v=0, max_v=100000)
+        settings["refill_max_per_scan"] = _coerce_int(settings.get("refill_max_per_scan"), 30, min_v=1, max_v=10000)
+        settings["refill_workers"] = _coerce_int(settings.get("refill_workers"), -1, min_v=-1, max_v=20)
+        settings["refill_probe_chat"] = _coerce_bool(settings.get("refill_probe_chat"), False)
+        settings["scan_history_limit"] = _coerce_int(settings.get("scan_history_limit"), 100, min_v=0, max_v=1000)
+        return settings
 
     def _load_state(self) -> None:
         if not STATE_PATH.is_file():
@@ -486,59 +523,229 @@ class CpaPoolMonitor:
             history = data.get("scan_history") or []
             if isinstance(history, list):
                 self._scan_history = [_beijingize_record(dict(item)) for item in history if isinstance(item, dict)]
-            self._finished_at = timeutil.iso_to_beijing_display(data.get("finished_at")) if data.get("finished_at") else ""
+            finished_value = data.get("finished_at") or self._summary.get("finished_at") or ""
+            self._last_finished_ts = _iso_to_ts(str(finished_value))
+            self._finished_at = timeutil.iso_to_beijing_display(finished_value) if finished_value else ""
+            self._started_at = str(data.get("started_at") or "")
+            self._scan_id = str(data.get("scan_id") or "")
+            self._last_error = str(data.get("last_error") or "")
+            if isinstance(data.get("progress"), dict):
+                self._progress = dict(data["progress"])
+            logs = data.get("logs") or []
+            if isinstance(logs, list):
+                self._logs.extend(str(line) for line in logs if isinstance(line, str))
+            try:
+                self._next_scan_at = max(0.0, float(data.get("next_scan_at") or 0))
+            except (TypeError, ValueError):
+                self._next_scan_at = 0.0
+            self._scheduled_interval_sec = _coerce_int(data.get("scheduled_interval_sec"), 0, min_v=0, max_v=86400)
+            self._resume_count = _coerce_int(data.get("resume_count"), 0, min_v=0)
+            self._resumed_at = str(data.get("resumed_at") or "")
+
+            active = data.get("active_scan")
+            if isinstance(active, dict) and str(active.get("status") or "") == "running":
+                restored = dict(active)
+                restored["items"] = [dict(item) for item in (active.get("items") or []) if isinstance(item, dict)]
+                restored["completed"] = list(
+                    dict.fromkeys(str(key) for key in (active.get("completed") or []) if str(key))
+                )
+                restored["options"] = dict(active.get("options") or {}) if isinstance(active.get("options"), dict) else {}
+                restored["settings"] = dict(active.get("settings") or {}) if isinstance(active.get("settings"), dict) else {}
+                self._active_scan = restored
+                self._scan_id = str(restored.get("scan_id") or self._scan_id)
+                self._started_at = str(restored.get("started_at") or self._started_at)
+                self._resume_count = _coerce_int(restored.get("resume_count"), self._resume_count, min_v=0)
+                self._resumed_at = str(restored.get("resumed_at") or self._resumed_at)
+                if restored["settings"]:
+                    loaded_settings = dict(DEFAULT_SETTINGS)
+                    loaded_settings.update(restored["settings"])
+                    self._settings = loaded_settings
+                self._recovery_pending = not bool(restored.get("cancel_requested"))
         except Exception:
             return
 
-    def _save_state(self) -> None:
-        with self._lock:
-            payload = {
-                "finished_at": self._finished_at,
-                "summary": dict(self._summary),
-                "scan_history": [dict(v) for v in self._scan_history],
-                "results": {k: dict(v) for k, v in self._results.items()},
-            }
+    def _save_state(self) -> bool:
         try:
-            tmp = STATE_PATH.with_name(f".{STATE_PATH.name}.tmp")
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            os.replace(tmp, STATE_PATH)
+            with self._state_write_lock:
+                with self._lock:
+                    payload = {
+                        "state_version": STATE_VERSION,
+                        "next_scan_at": self._next_scan_at,
+                        "scheduled_interval_sec": self._scheduled_interval_sec,
+                        "scan_id": self._scan_id,
+                        "started_at": self._started_at,
+                        "finished_at": self._finished_at,
+                        "last_error": self._last_error,
+                        "progress": dict(self._progress),
+                        "summary": dict(self._summary),
+                        "logs": list(self._logs),
+                        "resume_count": self._resume_count,
+                        "resumed_at": self._resumed_at,
+                        "active_scan": dict(self._active_scan) if self._active_scan else None,
+                        "scan_history": [dict(v) for v in self._scan_history],
+                        "results": {k: dict(v) for k, v in self._results.items()},
+                    }
+                    encoded = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+                STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                tmp = STATE_PATH.with_name(f".{STATE_PATH.name}.tmp")
+                tmp.write_text(encoded, encoding="utf-8")
+                os.replace(tmp, STATE_PATH)
+            return True
         except Exception:
-            pass
+            return False
+
+    def _sync_schedule_locked(self, settings: dict[str, Any], *, now: float) -> bool:
+        interval = _coerce_int(settings.get("scan_interval_sec"), 300, min_v=30, max_v=86400)
+        changed = False
+        if self._scheduled_interval_sec <= 0:
+            self._scheduled_interval_sec = interval
+            changed = True
+            if not self._next_scan_at:
+                base = self._last_finished_ts or now
+                self._next_scan_at = base + interval
+        elif self._scheduled_interval_sec != interval:
+            self._scheduled_interval_sec = interval
+            self._next_scan_at = now + interval
+            changed = True
+        elif not self._next_scan_at:
+            self._next_scan_at = now + interval
+            changed = True
+        return changed
+
+    def _prepare_recovery_locked(self) -> threading.Thread | None:
+        active = self._active_scan
+        if self._running or str(active.get("status") or "") != "running" or active.get("cancel_requested"):
+            return None
+        self._running = True
+        self._cancel.clear()
+        self._scan_id = str(active.get("scan_id") or self._scan_id or uuid.uuid4().hex[:10])
+        self._started_at = str(active.get("started_at") or self._started_at or _utc_now())
+        self._finished_at = ""
+        self._last_error = ""
+        loaded_settings = dict(DEFAULT_SETTINGS)
+        loaded_settings.update(dict(active.get("settings") or {}))
+        self._settings = loaded_settings
+        active["settings"] = loaded_settings
+        self._resume_count = _coerce_int(active.get("resume_count"), 0, min_v=0) + 1
+        self._resumed_at = _utc_now()
+        self._recovery_pending = False
+        active.update(
+            {
+                "scan_id": self._scan_id,
+                "started_at": self._started_at,
+                "resume_count": self._resume_count,
+                "resumed_at": self._resumed_at,
+            }
+        )
+        options = dict(active.get("options") or {})
+        t = threading.Thread(
+            target=self._run_scan,
+            args=(options,),
+            kwargs={"resume": True},
+            daemon=True,
+            name="cpa-pool-scan",
+        )
+        self._scan_thread = t
+        return t
+
+    def _finalize_persisted_cancellation(self, *, schedule_settings: dict[str, Any]) -> None:
+        with self._lock:
+            active = dict(self._active_scan)
+            if str(active.get("status") or "") != "running" or not active.get("cancel_requested"):
+                return
+            self._scan_id = str(active.get("scan_id") or self._scan_id or uuid.uuid4().hex[:10])
+            self._started_at = str(active.get("started_at") or self._started_at or _utc_now())
+            self._resume_count = _coerce_int(active.get("resume_count"), self._resume_count, min_v=0)
+            self._resumed_at = str(active.get("resumed_at") or self._resumed_at)
+            loaded_settings = dict(DEFAULT_SETTINGS)
+            loaded_settings.update(dict(active.get("settings") or {}))
+            self._settings = loaded_settings
+            self._cancel.set()
+            self._running = False
+            self._recovery_pending = False
+            self._finished_at = _utc_now()
+            self._last_finished_ts = time.time()
+            self._summary.setdefault("trigger", active.get("trigger") or "manual")
+            self._summary.setdefault("started_at", self._started_at)
+            self._summary["done"] = int(self._progress.get("done") or self._summary.get("done") or 0)
+            self._summary["elapsed_sec"] = self._elapsed_sec()
+            self._summary["finished_at"] = self._finished_at
+            self._summary["refill"] = {
+                "enabled": bool(self._settings.get("auto_refill")),
+                "started": False,
+                "cancelled": True,
+            }
+            self._active_scan = {}
+            interval = _coerce_int(schedule_settings.get("scan_interval_sec"), 300, min_v=30, max_v=86400)
+            self._scheduled_interval_sec = interval
+            self._next_scan_at = time.time() + interval
+        self._log("检测到已持久化的停止请求，原巡检任务不再恢复")
+        self._append_scan_history(settings=self._settings)
+        self._save_state()
 
     def ensure_scheduler(self) -> None:
         cfg_settings = settings_from_config()
+        now = time.time()
+        recovery_thread: threading.Thread | None = None
+        scheduler_thread: threading.Thread | None = None
+        finalize_cancel = False
+        save_state = False
         with self._lock:
             if not self._running:
                 self._settings = cfg_settings
-            if not self._next_scan_at:
-                self._next_scan_at = time.time() + int(self._settings.get("scan_interval_sec") or 300)
-            if self._scheduler_thread and self._scheduler_thread.is_alive():
-                return
-            self._scheduler_stop.clear()
-            t = threading.Thread(target=self._scheduler_loop, daemon=True, name="cpa-pool-scheduler")
-            self._scheduler_thread = t
-            t.start()
+            save_state = self._sync_schedule_locked(cfg_settings, now=now)
+            if str(self._active_scan.get("status") or "") == "running":
+                if self._active_scan.get("cancel_requested"):
+                    finalize_cancel = True
+                else:
+                    recovery_thread = self._prepare_recovery_locked()
+                    save_state = save_state or recovery_thread is not None
+            if not self._scheduler_thread or (
+                self._scheduler_thread.ident is not None and not self._scheduler_thread.is_alive()
+            ):
+                self._scheduler_stop.clear()
+                scheduler_thread = threading.Thread(target=self._scheduler_loop, daemon=True, name="cpa-pool-scheduler")
+                self._scheduler_thread = scheduler_thread
+        if finalize_cancel:
+            self._finalize_persisted_cancellation(schedule_settings=cfg_settings)
+        elif recovery_thread is not None:
+            self._log(
+                f"恢复 CPA 巡检：id={self._scan_id} done={self._progress.get('done', 0)}/"
+                f"{self._progress.get('total', 0)} resume={self._resume_count}"
+            )
+            self._save_state()
+            recovery_thread.start()
+        elif save_state:
+            self._save_state()
+        if scheduler_thread is not None:
+            scheduler_thread.start()
 
     def _scheduler_loop(self) -> None:
         while not self._scheduler_stop.is_set():
             try:
-                cfg_settings = settings_from_config()
-                with self._lock:
-                    if not self._running:
-                        self._settings = cfg_settings
-                auto = bool(cfg_settings.get("auto_scan"))
-                interval = int(cfg_settings.get("scan_interval_sec") or 300)
-                now = time.time()
-                if auto and not self._running and now >= float(self._next_scan_at or 0):
-                    self.start_scan({"trigger": "auto"})
-                    with self._lock:
-                        self._next_scan_at = now + interval
-                elif not auto:
-                    with self._lock:
-                        self._next_scan_at = now + interval
+                self._scheduler_tick()
             except Exception as exc:  # noqa: BLE001
                 self._log(f"scheduler error: {exc}")
             self._scheduler_stop.wait(1.0)
+
+    def _scheduler_tick(self, *, now: float | None = None) -> None:
+        cfg_settings = settings_from_config()
+        current = time.time() if now is None else float(now)
+        with self._lock:
+            if not self._running:
+                self._settings = cfg_settings
+            schedule_changed = self._sync_schedule_locked(cfg_settings, now=current)
+            due = (
+                bool(cfg_settings.get("auto_scan"))
+                and not self._running
+                and not self._recovery_pending
+                and str(self._active_scan.get("status") or "") != "running"
+                and current >= float(self._next_scan_at or 0)
+            )
+        if schedule_changed:
+            self._save_state()
+        if due:
+            self.start_scan({"trigger": "auto"})
 
     def status(self) -> dict[str, Any]:
         self.ensure_scheduler()
@@ -554,6 +761,10 @@ class CpaPoolMonitor:
             next_scan_at = self._next_scan_at
             results_total = len(self._results)
             scan_history_total = len(self._scan_history)
+            scan_id = self._scan_id
+            resume_count = self._resume_count
+            resumed_at = timeutil.iso_to_beijing_display(self._resumed_at) if self._resumed_at else ""
+            recovery_pending = self._recovery_pending
         try:
             cpa_total = len(store.list_cpa_index())
         except Exception:
@@ -564,12 +775,19 @@ class CpaPoolMonitor:
         quota = int(counts.get("quota") or 0) + int(counts.get("cooling") or 0)
         bad = sum(int(v or 0) for k, v in counts.items() if k not in {"ok", "quota", "cooling"})
         return {
+            "state_version": STATE_VERSION,
             "running": running,
             "started_at": started_at,
             "finished_at": finished_at,
             "last_error": last_error,
             "next_scan_at": next_scan_at,
+            "next_scan_at_display": timeutil.timestamp_display(next_scan_at) if next_scan_at else "",
             "next_scan_in_sec": max(0, int(next_scan_at - time.time())) if next_scan_at else 0,
+            "scan_id": scan_id,
+            "resumed": bool(running and resume_count > 0),
+            "resume_count": resume_count,
+            "resumed_at": resumed_at,
+            "recovery_pending": recovery_pending,
             "settings": settings,
             "progress": progress,
             "summary": summary,
@@ -644,12 +862,24 @@ class CpaPoolMonitor:
         return {"items": items[start : start + page_size], "total": total, "page": page, "page_size": page_size, "total_pages": total_pages, "dir": str(base)}
 
     def stop_scan(self) -> dict[str, Any]:
-        self._cancel.set()
-        self._log("收到停止巡检请求")
+        with self._lock:
+            running = self._running
+            if running:
+                self._cancel.set()
+                if self._active_scan:
+                    self._active_scan["cancel_requested"] = True
+                    self._active_scan["cancel_requested_at"] = _utc_now()
+        if running:
+            self._log("收到停止巡检请求")
+            self._save_state()
+        else:
+            self._log("当前没有运行中的 CPA 巡检")
         return self.status()
 
     def start_scan(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
         options = dict(options or {})
+        settings = self._effective_scan_settings(options)
+        trigger = str(options.get("trigger") or "manual")
         with self._lock:
             if self._running:
                 return {"started": False, "running": True, "status": self.status()}
@@ -660,8 +890,45 @@ class CpaPoolMonitor:
             self._finished_at = ""
             self._last_error = ""
             self._progress = {"done": 0, "total": 0}
-            self._summary = {"counts": {}, "actions": {}, "total": 0, "trigger": options.get("trigger") or "manual"}
-        t = threading.Thread(target=self._run_scan, args=(options,), daemon=True, name="cpa-pool-scan")
+            self._summary = {
+                "counts": {},
+                "actions": {},
+                "total": 0,
+                "trigger": trigger,
+                "started_at": self._started_at,
+            }
+            self._settings = settings
+            self._resume_count = 0
+            self._resumed_at = ""
+            self._recovery_pending = False
+            self._active_scan = {
+                "status": "running",
+                "scan_id": self._scan_id,
+                "trigger": trigger,
+                "options": options,
+                "settings": settings,
+                "started_at": self._started_at,
+                "initial_total": 0,
+                "snapshot_ready": False,
+                "items": [],
+                "completed": [],
+                "cancel_requested": False,
+                "resume_count": 0,
+                "resumed_at": "",
+            }
+        self._log(f"CPA 巡检任务已持久化：id={self._scan_id} trigger={trigger}")
+        if not self._save_state():
+            with self._lock:
+                self._running = False
+                self._active_scan = {}
+                self._last_error = "无法写入 CPA 巡检状态文件"
+            return {"started": False, "running": False, "error": self._last_error, "status": self.status()}
+        t = threading.Thread(
+            target=self._run_scan,
+            args=(options,),
+            daemon=True,
+            name="cpa-pool-scan",
+        )
         self._scan_thread = t
         t.start()
         return {"started": True, "running": True, "status": self.status()}
@@ -1088,6 +1355,8 @@ class CpaPoolMonitor:
             "auto_refill": bool(settings.get("auto_refill")),
             "scan_workers": int(settings.get("scan_workers") or 0),
             "limit": int(settings.get("max_items_per_scan") or 0),
+            "resume_count": self._resume_count,
+            "resumed_at": timeutil.iso_to_beijing_display(self._resumed_at) if self._resumed_at else "",
             "cancelled": cancelled or bool(refill.get("cancelled")),
             "error": last_error,
         }
@@ -1132,114 +1401,241 @@ class CpaPoolMonitor:
             "quarantine": self.list_quarantine(page_size=10000).get("items", []),
         }
 
-    def _run_scan(self, options: dict[str, Any]) -> None:
-        started = time.monotonic()
-        settings = settings_from_config()
-        for key in DEFAULT_SETTINGS:
-            if key in options:
-                settings[key] = options[key]
-        settings["scan_workers"] = _coerce_int(settings.get("scan_workers"), 16, min_v=1, max_v=100)
-        settings["probe_timeout_sec"] = _coerce_float(settings.get("probe_timeout_sec"), 30.0, min_v=3.0, max_v=180.0)
-        settings["probe_chat"] = _coerce_bool(settings.get("probe_chat"), False)
-        settings["refresh_before_probe"] = _coerce_bool(settings.get("refresh_before_probe"), True)
-        settings["apply_policy"] = _coerce_bool(settings.get("apply_policy"), False)
-        settings["auto_refill"] = _coerce_bool(settings.get("auto_refill"), False)
-        settings["refresh_skew_sec"] = _coerce_int(settings.get("refresh_skew_sec"), 2700, min_v=0, max_v=86400)
-        settings["max_items_per_scan"] = _coerce_int(settings.get("max_items_per_scan"), 0, min_v=0, max_v=100000)
-        settings["refill_target_active"] = _coerce_int(settings.get("refill_target_active"), 0, min_v=0, max_v=100000)
-        settings["refill_max_per_scan"] = _coerce_int(settings.get("refill_max_per_scan"), 30, min_v=1, max_v=10000)
-        settings["refill_workers"] = _coerce_int(settings.get("refill_workers"), -1, min_v=-1, max_v=20)
-        settings["refill_probe_chat"] = _coerce_bool(settings.get("refill_probe_chat"), False)
-        settings["scan_history_limit"] = _coerce_int(settings.get("scan_history_limit"), 100, min_v=0, max_v=1000)
-        trigger = str(options.get("trigger") or "manual")
-        self._settings = settings
-        self._log(f"CPA 巡检开始：trigger={trigger} workers={settings['scan_workers']} probe_chat={settings['probe_chat']} refresh={settings['refresh_before_probe']} proxy={settings.get('probe_proxy')} policy={settings.get('apply_policy')}")
+    @staticmethod
+    def _scan_item_key(item: dict[str, Any]) -> str:
+        return str(item.get("email") or item.get("path") or "").strip().lower()
+
+    def _run_scan(self, options: dict[str, Any], *, resume: bool = False) -> None:
+        fallback_started = time.monotonic()
+        with self._lock:
+            active = dict(self._active_scan)
+            settings = dict(DEFAULT_SETTINGS)
+            settings.update(self._settings)
+            settings.update(dict(active.get("settings") or {}))
+            trigger = str(active.get("trigger") or options.get("trigger") or "manual")
+            scan_id = str(active.get("scan_id") or self._scan_id)
+            snapshot_ready = bool(active.get("snapshot_ready"))
+            index = [dict(item) for item in (active.get("items") or []) if isinstance(item, dict)]
+            initial_total = _coerce_int(active.get("initial_total"), 0, min_v=0)
+        self._log(
+            f"CPA 巡检{'恢复执行' if resume else '开始'}：id={scan_id} trigger={trigger} "
+            f"workers={settings['scan_workers']} probe_chat={settings['probe_chat']} "
+            f"refresh={settings['refresh_before_probe']} proxy={settings.get('probe_proxy')} "
+            f"policy={settings.get('apply_policy')}"
+        )
         try:
-            index = list(store.list_cpa_index().values())
-            initial_total = len(index)
-            emails = {str(e).strip().lower() for e in (options.get("emails") or []) if str(e).strip()}
-            if emails:
-                index = [i for i in index if str(i.get("email") or "").lower() in emails]
-            limit_source = options["limit"] if "limit" in options else settings.get("max_items_per_scan")
-            limit = _coerce_int(limit_source, 0, min_v=0, max_v=100000)
-            if limit:
-                index = index[:limit]
-            total = len(index)
-            with self._lock:
-                self._progress = {"done": 0, "total": total}
-                self._summary = {"counts": {}, "actions": {}, "total": total, "trigger": trigger, "started_at": self._started_at}
-            if total == 0:
-                if self._cancel.is_set():
-                    refill = {"enabled": bool(settings.get("auto_refill")), "started": False, "cancelled": True}
-                else:
-                    refill = self._maybe_start_refill(settings=settings, initial_total=initial_total, trigger=trigger)
-                elapsed = round(time.monotonic() - started, 2)
+            if not snapshot_ready:
+                index = list(store.list_cpa_index().values())
+                initial_total = len(index)
+                emails = {str(e).strip().lower() for e in (options.get("emails") or []) if str(e).strip()}
+                if emails:
+                    index = [i for i in index if str(i.get("email") or "").lower() in emails]
+                limit_source = options["limit"] if "limit" in options else settings.get("max_items_per_scan")
+                limit = _coerce_int(limit_source, 0, min_v=0, max_v=100000)
+                if limit:
+                    index = index[:limit]
+                index = [dict(item) for item in index]
                 with self._lock:
-                    self._summary.update({"elapsed_sec": elapsed, "finished_at": _utc_now(), "refill": refill})
-                self._log("CPA 巡检：没有可检查的 xai-*.json")
-                return
+                    if self._active_scan.get("scan_id") == scan_id:
+                        self._active_scan.update(
+                            {
+                                "initial_total": initial_total,
+                                "snapshot_ready": True,
+                                "items": index,
+                                "snapshot_at": _utc_now(),
+                            }
+                        )
+                if not self._save_state():
+                    raise RuntimeError("无法持久化 CPA 巡检账号快照")
+
+            total = len(index)
+            item_keys = {self._scan_item_key(item) for item in index}
+            with self._lock:
+                completed = list(
+                    dict.fromkeys(
+                        key
+                        for key in (str(value) for value in (self._active_scan.get("completed") or []))
+                        if key and key in item_keys
+                    )
+                )
+                done = len(completed)
+                summary = dict(self._summary) if resume else {
+                    "counts": {},
+                    "actions": {},
+                }
+                summary.update(
+                    {
+                        "total": total,
+                        "done": done,
+                        "trigger": trigger,
+                        "started_at": self._started_at,
+                        "resume_count": self._resume_count,
+                        "resumed_at": self._resumed_at,
+                    }
+                )
+                summary.setdefault("counts", {})
+                summary.setdefault("actions", {})
+                self._summary = summary
+                self._progress = {"done": done, "total": total}
+                if self._active_scan.get("scan_id") == scan_id:
+                    self._active_scan["completed"] = completed
+                    self._active_scan["last_checkpoint_at"] = _utc_now()
+            if not self._save_state():
+                raise RuntimeError("无法持久化 CPA 巡检进度")
+
+            completed_set = set(completed)
+            pending = [item for item in index if self._scan_item_key(item) not in completed_set]
+            counts = {str(k): int(v or 0) for k, v in dict(self._summary.get("counts") or {}).items()}
+            actions = {str(k): int(v or 0) for k, v in dict(self._summary.get("actions") or {}).items()}
+            refreshed = int(self._summary.get("refreshed") or 0)
+            reenabled = int(self._summary.get("reenabled") or 0)
+
+            if resume:
+                self._log(f"巡检检查点已恢复：完成 {done}/{total}，剩余 {len(pending)}")
 
             proxy_picker = self._resolve_proxy_picker(str(settings.get("probe_proxy") or "direct"))
-            counts: dict[str, int] = {}
-            actions: dict[str, int] = {}
-            refreshed = 0
-            reenabled = 0
 
             def run_item(it: dict[str, Any]) -> dict[str, Any]:
                 if self._cancel.is_set():
-                    return {"email": str(it.get("email") or "").lower(), "path": str(it.get("path") or ""), "filename": Path(str(it.get("path") or "")).name, "location": it.get("location") or "", "checked_at": _utc_now(), "status": "soft_fail", "reason": "cancelled", "refreshed": False}
+                    return {
+                        "email": str(it.get("email") or "").lower(),
+                        "path": str(it.get("path") or ""),
+                        "filename": Path(str(it.get("path") or "")).name,
+                        "location": it.get("location") or "",
+                        "checked_at": _utc_now(),
+                        "status": "soft_fail",
+                        "reason": "cancelled",
+                        "refreshed": False,
+                    }
                 return self._scan_one(it, settings, proxy_picker)
 
-            workers = min(int(settings["scan_workers"]), max(1, total))
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cpa-scan") as ex:
-                futs = {ex.submit(run_item, item): item for item in index}
-                done = 0
-                for fut in as_completed(futs):
-                    raw_row = fut.result()
-                    merged = self._merge_result(raw_row, settings=settings)
-                    row = self._apply_policy(merged, settings)
-                    status = str(row.get("status") or "probe_failed")
-                    counts[status] = counts.get(status, 0) + 1
-                    if row.get("refreshed"):
-                        refreshed += 1
-                    if row.get("reenabled"):
-                        reenabled += 1
-                    if row.get("action"):
-                        actions[str(row.get("action"))] = actions.get(str(row.get("action")), 0) + 1
-                    email = str(row.get("email") or "").lower()
-                    with self._lock:
-                        if email:
-                            self._results[email] = row
-                        done += 1
-                        self._progress = {"done": done, "total": total, "current": email}
-                        self._summary = {"counts": dict(counts), "actions": dict(actions), "total": total, "done": done, "refreshed": refreshed, "reenabled": reenabled, "trigger": trigger, "started_at": self._started_at}
-                    if status != "ok" or row.get("action"):
-                        act = f" action={row.get('action')}" if row.get("action") else ""
-                        self._log(f"{email or row.get('filename')} -> {status}{act}: {row.get('reason')}")
-                    elif done <= 5 or done % 100 == 0:
-                        self._log(f"进度 {done}/{total}，OK={counts.get('ok', 0)}")
-                    if self._cancel.is_set():
-                        break
-            elapsed = round(time.monotonic() - started, 2)
+            if pending and not self._cancel.is_set():
+                workers = min(int(settings["scan_workers"]), len(pending))
+                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cpa-scan") as ex:
+                    futs = {ex.submit(run_item, item): item for item in pending}
+                    for fut in as_completed(futs):
+                        item = futs[fut]
+                        if self._cancel.is_set():
+                            for queued in futs:
+                                queued.cancel()
+                            break
+                        try:
+                            raw_row = fut.result()
+                        except Exception as exc:  # noqa: BLE001
+                            raw_row = {
+                                "email": str(item.get("email") or "").lower(),
+                                "path": str(item.get("path") or ""),
+                                "filename": Path(str(item.get("path") or "")).name,
+                                "location": item.get("location") or "",
+                                "checked_at": _utc_now(),
+                                "status": "soft_fail",
+                                "reason": f"scan worker: {_mask_error(exc)}",
+                                "refreshed": False,
+                            }
+                        merged = self._merge_result(raw_row, settings=settings)
+                        row = self._apply_policy(merged, settings)
+                        row["scan_id"] = scan_id
+                        status = str(row.get("status") or "probe_failed")
+                        counts[status] = counts.get(status, 0) + 1
+                        if row.get("refreshed"):
+                            refreshed += 1
+                        if row.get("reenabled"):
+                            reenabled += 1
+                        if row.get("action"):
+                            action = str(row.get("action"))
+                            actions[action] = actions.get(action, 0) + 1
+                        email = str(row.get("email") or "").lower()
+                        item_key = self._scan_item_key(item)
+                        with self._lock:
+                            if email:
+                                self._results[email] = row
+                            completed_set.add(item_key)
+                            completed = [key for key in completed if key != item_key]
+                            completed.append(item_key)
+                            done = len(completed_set)
+                            self._progress = {"done": done, "total": total, "current": email or item_key}
+                            self._summary = {
+                                "counts": dict(counts),
+                                "actions": dict(actions),
+                                "total": total,
+                                "done": done,
+                                "refreshed": refreshed,
+                                "reenabled": reenabled,
+                                "trigger": trigger,
+                                "started_at": self._started_at,
+                                "resume_count": self._resume_count,
+                                "resumed_at": self._resumed_at,
+                            }
+                            if self._active_scan.get("scan_id") == scan_id:
+                                self._active_scan["completed"] = list(completed)
+                                self._active_scan["last_checkpoint_at"] = _utc_now()
+                        if status != "ok" or row.get("action"):
+                            act = f" action={row.get('action')}" if row.get("action") else ""
+                            self._log(f"{email or row.get('filename')} -> {status}{act}: {row.get('reason')}")
+                        elif done <= 5 or done % 100 == 0:
+                            self._log(f"进度 {done}/{total}，OK={counts.get('ok', 0)}")
+                        if not self._save_state():
+                            self._log(f"巡检检查点写入失败：{email or item_key}")
+
             if self._cancel.is_set():
                 refill = {"enabled": bool(settings.get("auto_refill")), "started": False, "cancelled": True}
             else:
+                with self._lock:
+                    if self._active_scan.get("scan_id") == scan_id:
+                        self._active_scan["phase"] = "refill"
+                        self._active_scan["last_checkpoint_at"] = _utc_now()
+                self._save_state()
                 refill = self._maybe_start_refill(settings=settings, initial_total=initial_total, trigger=trigger)
+            elapsed = self._elapsed_sec(fallback_started=fallback_started)
             with self._lock:
-                self._summary.update({"elapsed_sec": elapsed, "finished_at": _utc_now(), "refreshed": refreshed, "reenabled": reenabled, "actions": dict(actions), "refill": refill})
-            self._log(f"CPA 巡检完成：total={total} ok={counts.get('ok', 0)} refreshed={refreshed} actions={actions} refill={refill.get('started', False)} elapsed={elapsed}s")
+                self._summary.update(
+                    {
+                        "elapsed_sec": elapsed,
+                        "finished_at": _utc_now(),
+                        "refreshed": refreshed,
+                        "reenabled": reenabled,
+                        "actions": dict(actions),
+                        "refill": refill,
+                    }
+                )
+            if total == 0:
+                self._log("CPA 巡检：没有可检查的 xai-*.json")
+            elif self._cancel.is_set():
+                self._log(f"CPA 巡检已取消：done={done}/{total} elapsed={elapsed}s")
+            else:
+                self._log(
+                    f"CPA 巡检完成：total={total} ok={counts.get('ok', 0)} refreshed={refreshed} "
+                    f"actions={actions} refill={refill.get('started', False)} elapsed={elapsed}s"
+                )
         except Exception as exc:  # noqa: BLE001
-            self._last_error = _mask_error(exc)
+            with self._lock:
+                self._last_error = _mask_error(exc)
             self._log(f"CPA 巡检异常：{exc}")
         finally:
+            finished_at = _utc_now()
+            with self._lock:
+                self._finished_at = finished_at
+                self._last_finished_ts = time.time()
+                self._progress = dict(self._progress)
+                self._progress["done"] = int(self._progress.get("done") or self._summary.get("done") or 0)
+                self._summary.setdefault("elapsed_sec", self._elapsed_sec(fallback_started=fallback_started))
+                self._summary["finished_at"] = finished_at
+                self._summary["resume_count"] = self._resume_count
+                self._summary["resumed_at"] = self._resumed_at
+            self._append_scan_history(settings=settings)
+            try:
+                current_settings = settings_from_config()
+            except Exception:
+                current_settings = dict(settings)
             with self._lock:
                 self._running = False
-                self._finished_at = _utc_now()
-                self._progress = dict(self._progress)
-                self._progress["done"] = self._progress.get("done") or self._summary.get("done") or 0
-                interval = int(self._settings.get("scan_interval_sec") or 300)
+                self._recovery_pending = False
+                if self._active_scan.get("scan_id") == scan_id:
+                    self._active_scan = {}
+                interval = _coerce_int(current_settings.get("scan_interval_sec"), 300, min_v=30, max_v=86400)
+                self._scheduled_interval_sec = interval
                 self._next_scan_at = time.time() + interval
-            self._append_scan_history(settings=self._settings)
+                self._settings = current_settings
             self._save_state()
 
 

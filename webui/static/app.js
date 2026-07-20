@@ -648,13 +648,14 @@ function renderCpaPoolStatus() {
   const settings = data.settings || {};
   const refill = s.refill || {};
   const running = Boolean(data.running);
+  const resumed = running && Boolean(data.resumed);
   const total = Number(data.cpa_total ?? s.total ?? 0);
   const done = Number(progress.done ?? s.done ?? 0);
   const scanTotal = Number(progress.total ?? s.total ?? 0);
   const pct = scanTotal ? Math.min(100, (done / scanTotal) * 100) : 0;
 
   $("#cpa-pool-state").className = `pill ${running ? "running" : (s.finished_at || data.finished_at ? "completed" : "idle")}`;
-  $("#cpa-pool-state").textContent = running ? "巡检中" : (s.finished_at || data.finished_at ? "已完成" : "未巡检");
+  $("#cpa-pool-state").textContent = running ? (resumed ? "恢复巡检中" : "巡检中") : (s.finished_at || data.finished_at ? "已完成" : "未巡检");
   $("#cpa-pool-stop").disabled = !running;
   $("#cpa-pool-scan").disabled = running;
   $("#cpa-pool-total").textContent = total;
@@ -668,7 +669,9 @@ function renderCpaPoolStatus() {
     ? (refill.started ? `+${refill.limit || refill.need || 0}` : (refill.need ? `待${refill.need}` : "ON"))
     : (settings.auto_refill ? "ON" : "OFF");
   $("#cpa-pool-progress").style.width = `${pct}%`;
-  const next = data.next_scan_in_sec != null ? `${data.next_scan_in_sec}s` : "-";
+  const next = data.next_scan_at_display
+    ? `${data.next_scan_at_display} (${data.next_scan_in_sec || 0}s)`
+    : (data.next_scan_in_sec != null ? `${data.next_scan_in_sec}s` : "-");
   const elapsed = s.elapsed_sec != null ? ` · 耗时 ${s.elapsed_sec}s` : "";
   const actions = s.actions ? Object.entries(s.actions).map(([k, v]) => `${k}:${v}`).join(" ") : "";
   const refillSkip = refill.error ? `skip ${refill.error}` : `need=${refill.need || 0}`;
@@ -676,6 +679,9 @@ function renderCpaPoolStatus() {
     ? (refill.started
       ? ` · 补号 <code>started need=${esc(refill.need || 0)} limit=${esc(refill.limit || 0)} excluded=${esc(refill.excluded || 0)}</code>`
       : ` · 补号 <code>${esc(refillSkip)}</code>`)
+    : "";
+  const resumeMeta = Number(data.resume_count || s.resume_count || 0) > 0
+    ? ` · 任务恢复 <code>${esc(data.resume_count || s.resume_count)}次</code>`
     : "";
   $("#cpa-pool-meta").innerHTML =
     `进度 <b>${done}/${scanTotal || total}</b>${elapsed} · 下次自动检查 ${esc(next)} · ` +
@@ -685,6 +691,7 @@ function renderCpaPoolStatus() {
     `治理 <code>${settings.apply_policy ? "ON" : "OFF"}</code> · ` +
     `自动补号 <code>${settings.auto_refill ? "ON" : "OFF"}</code>` +
     (actions ? ` · 动作 <code>${esc(actions)}</code>` : "") +
+    resumeMeta +
     refillMeta;
 
   const logs = data.logs || [];
@@ -754,7 +761,7 @@ function renderCpaScanHistory() {
       : "-";
     tr.innerHTML = `
       <td><span class="pill ${cpaScanOutcomePill(row.outcome)}">${esc(scanOutcomeText[row.outcome] || row.outcome || "-")}</span></td>
-      <td><span class="mono" title="${esc(row.id || "")}">${esc(row.finished_at || row.started_at || "-")}</span><small class="table-sub">${esc(row.trigger || "manual")}</small></td>
+      <td><span class="mono" title="${esc(row.id || "")}">${esc(row.finished_at || row.started_at || "-")}</span><small class="table-sub">${esc(row.trigger || "manual")}${row.resume_count ? ` · 恢复 ${esc(row.resume_count)}次` : ""}</small></td>
       <td><span class="mono">${esc(row.done ?? 0)}/${esc(row.total ?? 0)}</span><small class="table-sub">耗时 ${esc(row.elapsed_sec ?? "-")}s</small></td>
       <td><div class="mini-counts"><span class="ok">OK ${esc(row.ok || 0)}</span><span class="warn">额度 ${esc(row.quota || 0)}</span><span class="err">异常 ${esc(row.bad || 0)}</span></div></td>
       <td><span class="mono" title="${esc(counts)}">${esc(actions || "-")}</span><small class="table-sub">续期 ${esc(row.refreshed || 0)} · 恢复 ${esc(row.reenabled || 0)}</small></td>
@@ -1323,13 +1330,102 @@ function syncRegisterProtocolToggles() {
 
 /* ── tools ── */
 
-const convertState = { file: null, lastUrl: null, lastName: "" };
+const convertState = {
+  file: null,
+  lastUrl: null,
+  lastName: "",
+  detected: null,
+  inspectSeq: 0,
+  inspecting: false,
+};
+
+function setConvertTargetAvailability(available = null) {
+  const allowed = available ? new Set(available) : null;
+  const select = $("#convert-to");
+  for (const option of select.options) {
+    option.disabled = Boolean(allowed && option.value !== "auto" && !allowed.has(option.value));
+  }
+  if (select.selectedOptions[0]?.disabled) select.value = "auto";
+}
+
+function renderConvertInspect(payload, error = "") {
+  const panel = $("#convert-inspect");
+  panel.hidden = false;
+  panel.classList.toggle("error", Boolean(error));
+  if (error) {
+    $("#convert-detected-format").textContent = "无法识别";
+    $("#convert-detected-direction").textContent = error;
+    $("#convert-detected-count").textContent = "检查失败";
+    $("#convert-detected-providers").innerHTML = "";
+    $("#convert-detected-warnings").hidden = true;
+    return;
+  }
+  if (!payload) {
+    $("#convert-detected-format").textContent = "识别中";
+    $("#convert-detected-direction").textContent = "正在检查文件结构";
+    $("#convert-detected-count").textContent = "-";
+    $("#convert-detected-providers").innerHTML = "";
+    $("#convert-detected-warnings").hidden = true;
+    return;
+  }
+  $("#convert-detected-format").textContent = payload.input_format || "已识别";
+  $("#convert-detected-direction").textContent = payload.direction || "";
+  $("#convert-detected-count").textContent = `${payload.account_count || 0} 个账号`;
+  $("#convert-detected-providers").innerHTML = Object.entries(payload.providers || {})
+    .map(([provider, count]) => `<span><b>${esc(provider)}</b>${esc(count)}</span>`)
+    .join("");
+  const warningBox = $("#convert-detected-warnings");
+  const warnings = payload.warnings || [];
+  warningBox.hidden = !warnings.length;
+  warningBox.innerHTML = warnings.length
+    ? warnings.slice(0, 4).map((warning) => `<span>${esc(warning)}</span>`).join("")
+    : "";
+}
+
+async function inspectConvertFile(file) {
+  const seq = ++convertState.inspectSeq;
+  convertState.detected = null;
+  convertState.inspecting = true;
+  $("#convert-run").disabled = true;
+  setConvertTargetAvailability(null);
+  renderConvertInspect(null);
+  const form = new FormData();
+  form.append("file", file);
+  try {
+    const resp = await fetch("/api/tools/convert/inspect", { method: "POST", body: form });
+    const payload = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(payload.error || `HTTP ${resp.status}`);
+    if (seq !== convertState.inspectSeq) return;
+    convertState.detected = payload;
+    renderConvertInspect(payload);
+    setConvertTargetAvailability(payload.available_targets || null);
+  } catch (err) {
+    if (seq !== convertState.inspectSeq) return;
+    renderConvertInspect(null, err.message);
+  } finally {
+    if (seq === convertState.inspectSeq) {
+      convertState.inspecting = false;
+      $("#convert-run").disabled = !convertState.detected;
+    }
+  }
+}
 
 function convertSetFile(file) {
   convertState.file = file || null;
+  convertState.detected = null;
+  convertState.inspectSeq += 1;
   $("#convert-file-label").textContent = file
     ? `${file.name}（${(file.size / 1024).toFixed(1)} KB）`
     : "拖拽文件到这里，或点击选择";
+  $("#convert-result").hidden = true;
+  $("#convert-status").textContent = "";
+  if (file) {
+    inspectConvertFile(file);
+  } else {
+    $("#convert-inspect").hidden = true;
+    $("#convert-run").disabled = false;
+    setConvertTargetAvailability(null);
+  }
 }
 
 function convertDownload(blob, filename) {
@@ -1343,9 +1439,28 @@ function convertDownload(blob, filename) {
   a.click();
 }
 
+function decodeConversionMeta(value) {
+  if (!value) return null;
+  try {
+    const padded = value + "=".repeat((4 - (value.length % 4)) % 4);
+    const bytes = Uint8Array.from(atob(padded.replace(/-/g, "+").replace(/_/g, "/")), (char) => char.charCodeAt(0));
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch (_) {
+    return null;
+  }
+}
+
 async function runConvert() {
   if (!convertState.file) {
     toast("请先选择要转换的文件", true);
+    return;
+  }
+  if (convertState.inspecting) {
+    toast("文件仍在识别中", true);
+    return;
+  }
+  if (!convertState.detected) {
+    toast("文件格式未通过识别", true);
     return;
   }
   const btn = $("#convert-run");
@@ -1368,10 +1483,19 @@ async function runConvert() {
       ? decodeURIComponent(match[1].replace(/"/g, ""))
       : `converted-${Date.now()}`;
     const blob = await resp.blob();
+    const meta = decodeConversionMeta(resp.headers.get("x-conversion-meta"));
     convertDownload(blob, filename);
     $("#convert-result").hidden = false;
     $("#convert-result-name").textContent = filename;
-    $("#convert-result-meta").textContent = `${(blob.size / 1024).toFixed(1)} KB · 已自动开始下载`;
+    const providerText = Object.entries(meta?.providers || {})
+      .map(([provider, count]) => `${provider} ${count}`)
+      .join(" · ");
+    $("#convert-result-meta").textContent = [
+      `${(blob.size / 1024).toFixed(1)} KB`,
+      meta?.count ? `${meta.count} 个账号` : "",
+      providerText,
+      "已自动开始下载",
+    ].filter(Boolean).join(" · ");
     status.textContent = "";
     toast("转换完成，已开始下载");
   } catch (err) {

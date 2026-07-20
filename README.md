@@ -277,12 +277,58 @@ http://127.0.0.1:8787
 |------|------|
 | 注册控制 | 启动/停止批量注册，看实时 stats 与日志 |
 | 账号账本 | 浏览/导出/删除 `accounts_cli.txt`，选中补 CPA |
-| CPA 管理 | 管理 `cpa_auths/xai-*.json`，补缺失 mint |
+| CPA 文件 | 管理、巡检和治理 `cpa_auths/xai-*.json`，补缺失 mint |
 | 邮箱凭证 | 导入/删除 Hotmail 四段凭证 |
+| 工具 | 自动识别并双向转换 Sub2API 账号包与 CLIProxyAPI auth 文件 |
 | 配置中心 | 编辑 `config.json` 常用项 |
 | 任务记录 | 右侧抽屉查看历史任务与停止 |
 
 WebUI **不另建数据库**，直接读写现有文件账本，与 CLI / ttk 共用数据。
+
+CPA 巡检计划、运行参数、账号快照和逐账号完成检查点保存在 `cpa_pool_state.json`。WebUI
+服务重启后会沿用原巡检 ID 和原配置继续未完成账号，已完成账号不会重复探测；自动巡检的
+下次执行时间也不会因重启重新计算。该运行态文件已被 Git 和部署覆盖规则排除。
+
+#### 账号格式转换
+
+- 输入支持单个 JSON、账号数组、Sub2API API 响应/导入包装、目录打包 ZIP 和嵌套 ZIP。
+- CLIProxyAPI provider 支持 `xai`、`codex`、`claude`、`gemini`、`antigravity`、`kimi`、`vertex`，并兼容旧版 `qwen`、`iflow`、`kiro`。
+- 可识别 Codex CLI `auth.json`、Claude Code `claudeAiOauth` 和 Gemini OAuth 凭证；未知插件 provider 会保留字段并支持往返。
+- Sub2API 代理绑定与 CLIProxyAPI `proxy_url` 双向转换；`oauth/apikey/setup-token/upstream/bedrock` 等账号类型会保留。
+
+也可从命令行预检或转换：
+
+```bash
+uv run python account_convert.py accounts.zip --inspect
+uv run python account_convert.py accounts.zip --to auto -o converted
+```
+
+#### GitHub Actions 一键部署
+
+工作流：`Actions` → `Deploy to server` → `Run workflow`。默认先运行完整测试，再部署 `master`；生产任务拒绝其他分支。
+
+首次使用需要在 GitHub 仓库配置以下 Actions secrets：
+
+| Secret | 说明 |
+|--------|------|
+| `DEPLOY_SSH_KEY` | 仅用于部署的 SSH 私钥，建议使用独立 Ed25519 密钥 |
+| `DEPLOY_KNOWN_HOSTS` | 目标服务器的固定 SSH host key；工作流启用严格校验 |
+
+以及 Actions variables：
+
+| Variable | 示例 | 说明 |
+|----------|------|------|
+| `DEPLOY_HOST` | `server.example.com` | SSH 主机名或 IP |
+| `DEPLOY_PORT` | `22` | SSH 端口 |
+| `DEPLOY_USER` | `root` | 部署用户；非 root 需有免密 systemd sudo 权限 |
+| `DEPLOY_PATH` | `/root/grok_reg-protocol_cpa` | 服务器项目目录 |
+| `DEPLOY_SERVICE` | `grok-reg-webui.service` | 需要重启的 systemd 服务 |
+| `DEPLOY_HEALTH_URL` | `http://127.0.0.1:8787/healthz` | 服务器本机健康检查地址 |
+| `DEPLOY_PUBLIC_URL` | `https://example.com` | 可选，显示在 GitHub deployment 页面 |
+| `DEPLOY_BACKUP_DIR` | `/root/grok_reg_backups` | 可选，部署备份目录 |
+| `DEPLOY_BACKUP_KEEP` | `20` | 可选，保留的 Action 部署备份数量 |
+
+部署包只包含 Git 跟踪文件，不包含被 `.gitignore` 排除的账号、配置和运行状态。服务器脚本还会二次拒绝 `config.json`、`accounts_*.txt`、`mail_credentials.txt`、`cpa_auths/` 等运行态文件。每次部署会备份即将覆盖的文件，执行 `uv sync --frozen`，重启服务并轮询健康检查；失败时自动恢复备份并重启旧版本。
 
 ### 验证环境
 

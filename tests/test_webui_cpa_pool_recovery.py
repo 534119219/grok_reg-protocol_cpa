@@ -1,0 +1,389 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from webui import cpa_pool
+
+
+class WebuiCpaPoolRecoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_path = Path(self._tmp.name) / "cpa_pool_state.json"
+        self._state_patch = mock.patch.object(cpa_pool, "STATE_PATH", self.state_path)
+        self._state_patch.start()
+        self._monitors: list[cpa_pool.CpaPoolMonitor] = []
+
+    def tearDown(self) -> None:
+        for monitor in self._monitors:
+            monitor._scheduler_stop.set()
+            if monitor._scheduler_thread and monitor._scheduler_thread.is_alive():
+                monitor._scheduler_thread.join(timeout=2)
+        self._state_patch.stop()
+        self._tmp.cleanup()
+
+    def _monitor(self) -> cpa_pool.CpaPoolMonitor:
+        monitor = cpa_pool.CpaPoolMonitor()
+        self._monitors.append(monitor)
+        return monitor
+
+    @staticmethod
+    def _settings(**overrides):
+        settings = dict(cpa_pool.DEFAULT_SETTINGS)
+        settings.update(
+            {
+                "auto_scan": False,
+                "scan_interval_sec": 300,
+                "scan_workers": 1,
+                "probe_chat": False,
+                "apply_policy": False,
+                "auto_refill": False,
+            }
+        )
+        settings.update(overrides)
+        return settings
+
+    def test_schedule_deadline_survives_monitor_restart(self):
+        deadline = time.time() + 1800
+        first = self._monitor()
+        first._next_scan_at = deadline
+        first._scheduled_interval_sec = 1800
+        self.assertTrue(first._save_state())
+
+        second = self._monitor()
+        settings = self._settings(auto_scan=True, scan_interval_sec=1800)
+        with mock.patch("webui.cpa_pool.settings_from_config", return_value=settings):
+            second.ensure_scheduler()
+
+        self.assertEqual(second._next_scan_at, deadline)
+        self.assertEqual(second._scheduled_interval_sec, 1800)
+
+    def test_legacy_state_derives_deadline_from_last_finish(self):
+        finished_at = "2026-07-21T02:00:00+08:00"
+        self.state_path.write_text(
+            json.dumps(
+                {
+                    "finished_at": finished_at,
+                    "summary": {"finished_at": finished_at, "counts": {}, "actions": {}},
+                    "results": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monitor = self._monitor()
+        settings = self._settings(auto_scan=True, scan_interval_sec=1800)
+
+        with mock.patch("webui.cpa_pool.settings_from_config", return_value=settings):
+            monitor.ensure_scheduler()
+
+        self.assertEqual(monitor._next_scan_at, cpa_pool._iso_to_ts(finished_at) + 1800)
+        self.assertEqual(monitor._scheduled_interval_sec, 1800)
+
+    def test_disabled_auto_scan_does_not_slide_deadline(self):
+        monitor = self._monitor()
+        monitor._next_scan_at = 1500.0
+        monitor._scheduled_interval_sec = 300
+        settings = self._settings(auto_scan=False, scan_interval_sec=300)
+
+        with mock.patch("webui.cpa_pool.settings_from_config", return_value=settings):
+            monitor._scheduler_tick(now=1000.0)
+            monitor._scheduler_tick(now=1200.0)
+
+        self.assertEqual(monitor._next_scan_at, 1500.0)
+
+    def test_interval_change_recalculates_deadline_once(self):
+        monitor = self._monitor()
+        monitor._next_scan_at = 1300.0
+        monitor._scheduled_interval_sec = 300
+        settings = self._settings(auto_scan=False, scan_interval_sec=600)
+
+        with mock.patch("webui.cpa_pool.settings_from_config", return_value=settings):
+            monitor._scheduler_tick(now=1000.0)
+            self.assertEqual(monitor._next_scan_at, 1600.0)
+            monitor._scheduler_tick(now=1100.0)
+
+        self.assertEqual(monitor._next_scan_at, 1600.0)
+        self.assertEqual(monitor._scheduled_interval_sec, 600)
+
+    def test_fresh_scan_persists_snapshot_before_account_finishes(self):
+        monitor = self._monitor()
+        entered = threading.Event()
+        release = threading.Event()
+        settings = self._settings(auto_scan=False, scan_workers=1)
+        item = {
+            "email": "fresh@example.com",
+            "path": "/tmp/xai-fresh.json",
+            "location": "auth_dir",
+        }
+
+        def scan_one(scan_item, _settings, _proxy_picker):
+            entered.set()
+            release.wait(timeout=5)
+            return {
+                "email": scan_item["email"],
+                "path": scan_item["path"],
+                "filename": Path(scan_item["path"]).name,
+                "location": scan_item["location"],
+                "checked_at": cpa_pool._utc_now(),
+                "status": "ok",
+                "reason": "models ok",
+                "refreshed": False,
+                "reenabled": False,
+            }
+
+        with (
+            mock.patch("webui.cpa_pool.settings_from_config", return_value=settings),
+            mock.patch("webui.cpa_pool.store.list_cpa_index", return_value={"fresh@example.com": item}),
+            mock.patch.object(monitor, "_scan_one", side_effect=scan_one),
+            mock.patch.object(monitor, "_maybe_start_refill", return_value={"enabled": False, "started": False}),
+            mock.patch.object(monitor, "quarantine_summary", return_value={"total": 0}),
+        ):
+            result = monitor.start_scan({"trigger": "manual", "probe_chat": False})
+            self.assertTrue(result["started"])
+            self.assertTrue(entered.wait(timeout=2))
+            persisted = json.loads(self.state_path.read_text(encoding="utf-8"))
+            active = persisted["active_scan"]
+            self.assertEqual(active["status"], "running")
+            self.assertEqual(active["scan_id"], monitor._scan_id)
+            self.assertTrue(active["snapshot_ready"])
+            self.assertEqual([row["email"] for row in active["items"]], ["fresh@example.com"])
+            self.assertEqual(active["completed"], [])
+            release.set()
+            monitor._scan_thread.join(timeout=5)
+
+        self.assertFalse(monitor._scan_thread.is_alive())
+        self.assertEqual(monitor._progress["done"], 1)
+        self.assertEqual(len(monitor._scan_history), 1)
+        persisted = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertIsNone(persisted["active_scan"])
+
+    def _persist_interrupted_scan(self, *, trigger: str, cancel_requested: bool = False) -> None:
+        settings = self._settings(probe_chat=True)
+        options = {"trigger": trigger, "probe_chat": True, "limit": 2}
+        items = [
+            {"email": "done@example.com", "path": "/tmp/xai-done.json", "location": "auth_dir"},
+            {"email": "pending@example.com", "path": "/tmp/xai-pending.json", "location": "auth_dir"},
+        ]
+        monitor = self._monitor()
+        monitor._scan_id = "persisted1"
+        monitor._started_at = cpa_pool._utc_now()
+        monitor._next_scan_at = time.time() + 300
+        monitor._scheduled_interval_sec = 300
+        monitor._settings = settings
+        monitor._progress = {"done": 1, "total": 2, "current": "done@example.com"}
+        monitor._summary = {
+            "counts": {"ok": 1},
+            "actions": {},
+            "total": 2,
+            "done": 1,
+            "refreshed": 0,
+            "reenabled": 0,
+            "trigger": trigger,
+            "started_at": monitor._started_at,
+        }
+        monitor._results = {
+            "done@example.com": {
+                "email": "done@example.com",
+                "status": "ok",
+                "checked_at": monitor._started_at,
+                "scan_id": "persisted1",
+            }
+        }
+        monitor._active_scan = {
+            "status": "running",
+            "scan_id": "persisted1",
+            "trigger": trigger,
+            "options": options,
+            "settings": settings,
+            "started_at": monitor._started_at,
+            "initial_total": 2,
+            "snapshot_ready": True,
+            "items": items,
+            "completed": ["done@example.com"],
+            "cancel_requested": cancel_requested,
+            "resume_count": 0,
+            "resumed_at": "",
+        }
+        self.assertTrue(monitor._save_state())
+
+    def _assert_scan_recovers(self, trigger: str) -> None:
+        self._persist_interrupted_scan(trigger=trigger)
+        monitor = self._monitor()
+        checked: list[tuple[str, bool]] = []
+
+        def scan_one(item, settings, _proxy_picker):
+            checked.append((str(item.get("email")), bool(settings.get("probe_chat"))))
+            return {
+                "email": item["email"],
+                "path": item["path"],
+                "filename": Path(item["path"]).name,
+                "location": item["location"],
+                "checked_at": cpa_pool._utc_now(),
+                "status": "ok",
+                "reason": "models ok",
+                "refreshed": False,
+                "reenabled": False,
+            }
+
+        settings = self._settings(auto_scan=False, scan_interval_sec=300)
+        index = {
+            "done@example.com": {"email": "done@example.com"},
+            "pending@example.com": {"email": "pending@example.com"},
+        }
+        with (
+            mock.patch("webui.cpa_pool.settings_from_config", return_value=settings),
+            mock.patch("webui.cpa_pool.store.list_cpa_index", return_value=index),
+            mock.patch.object(monitor, "_scan_one", side_effect=scan_one),
+            mock.patch.object(monitor, "_maybe_start_refill", return_value={"enabled": False, "started": False}),
+            mock.patch.object(monitor, "quarantine_summary", return_value={"total": 0}),
+        ):
+            monitor.ensure_scheduler()
+            self.assertIsNotNone(monitor._scan_thread)
+            monitor._scan_thread.join(timeout=5)
+
+        self.assertFalse(monitor._scan_thread.is_alive())
+        self.assertEqual(checked, [("pending@example.com", True)])
+        self.assertEqual(monitor._scan_id, "persisted1")
+        self.assertEqual(monitor._resume_count, 1)
+        self.assertEqual(monitor._progress["done"], 2)
+        self.assertEqual(len(monitor._scan_history), 1)
+        history = monitor._scan_history[0]
+        self.assertEqual(history["id"], "persisted1")
+        self.assertEqual(history["trigger"], trigger)
+        self.assertEqual(history["done"], 2)
+        self.assertEqual(history["resume_count"], 1)
+        persisted = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertIsNone(persisted["active_scan"])
+
+    def test_manual_scan_recovers_and_skips_completed_accounts(self):
+        self._assert_scan_recovers("manual")
+
+    def test_auto_scan_recovers_and_skips_completed_accounts(self):
+        self._assert_scan_recovers("auto")
+
+    def test_recovery_before_snapshot_reuses_original_filter_options(self):
+        settings = self._settings(probe_chat=True)
+        monitor = self._monitor()
+        monitor._scan_id = "preparing1"
+        monitor._started_at = cpa_pool._utc_now()
+        monitor._next_scan_at = time.time() + 300
+        monitor._scheduled_interval_sec = 300
+        monitor._settings = settings
+        monitor._summary = {"counts": {}, "actions": {}, "total": 0, "done": 0, "trigger": "manual"}
+        monitor._active_scan = {
+            "status": "running",
+            "scan_id": "preparing1",
+            "trigger": "manual",
+            "options": {
+                "trigger": "manual",
+                "emails": ["selected@example.com"],
+                "limit": 1,
+                "probe_chat": True,
+            },
+            "settings": settings,
+            "started_at": monitor._started_at,
+            "initial_total": 0,
+            "snapshot_ready": False,
+            "items": [],
+            "completed": [],
+            "cancel_requested": False,
+            "resume_count": 0,
+        }
+        self.assertTrue(monitor._save_state())
+
+        recovered = self._monitor()
+        checked: list[str] = []
+        index = {
+            "other@example.com": {
+                "email": "other@example.com",
+                "path": "/tmp/xai-other.json",
+                "location": "auth_dir",
+            },
+            "selected@example.com": {
+                "email": "selected@example.com",
+                "path": "/tmp/xai-selected.json",
+                "location": "auth_dir",
+            },
+        }
+
+        def scan_one(item, scan_settings, _proxy_picker):
+            checked.append(str(item["email"]))
+            self.assertTrue(scan_settings["probe_chat"])
+            return {
+                "email": item["email"],
+                "path": item["path"],
+                "filename": Path(item["path"]).name,
+                "location": item["location"],
+                "checked_at": cpa_pool._utc_now(),
+                "status": "ok",
+                "reason": "models ok",
+                "refreshed": False,
+                "reenabled": False,
+            }
+
+        current_settings = self._settings(auto_scan=False, probe_chat=False)
+        with (
+            mock.patch("webui.cpa_pool.settings_from_config", return_value=current_settings),
+            mock.patch("webui.cpa_pool.store.list_cpa_index", return_value=index),
+            mock.patch.object(recovered, "_scan_one", side_effect=scan_one),
+            mock.patch.object(recovered, "_maybe_start_refill", return_value={"enabled": False, "started": False}),
+            mock.patch.object(recovered, "quarantine_summary", return_value={"total": 0}),
+        ):
+            recovered.ensure_scheduler()
+            recovered._scan_thread.join(timeout=5)
+
+        self.assertEqual(checked, ["selected@example.com"])
+        self.assertEqual(recovered._scan_history[0]["id"], "preparing1")
+        self.assertEqual(recovered._scan_history[0]["total"], 1)
+
+    def test_cancelled_scan_is_finalized_instead_of_resumed(self):
+        self._persist_interrupted_scan(trigger="manual", cancel_requested=True)
+        monitor = self._monitor()
+        settings = self._settings(auto_scan=False, scan_interval_sec=300)
+        index = {
+            "done@example.com": {"email": "done@example.com"},
+            "pending@example.com": {"email": "pending@example.com"},
+        }
+        with (
+            mock.patch("webui.cpa_pool.settings_from_config", return_value=settings),
+            mock.patch("webui.cpa_pool.store.list_cpa_index", return_value=index),
+            mock.patch.object(monitor, "_scan_one") as scan_one,
+            mock.patch.object(monitor, "quarantine_summary", return_value={"total": 0}),
+        ):
+            monitor.ensure_scheduler()
+
+        scan_one.assert_not_called()
+        self.assertFalse(monitor._running)
+        self.assertFalse(monitor._active_scan)
+        self.assertEqual(len(monitor._scan_history), 1)
+        self.assertEqual(monitor._scan_history[0]["id"], "persisted1")
+        self.assertEqual(monitor._scan_history[0]["outcome"], "cancelled")
+        persisted = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertIsNone(persisted["active_scan"])
+
+    def test_stop_request_is_persisted_before_worker_exits(self):
+        monitor = self._monitor()
+        monitor._running = True
+        monitor._scan_id = "stopping1"
+        monitor._active_scan = {
+            "status": "running",
+            "scan_id": "stopping1",
+            "cancel_requested": False,
+        }
+
+        with mock.patch.object(monitor, "status", return_value={"running": True}):
+            result = monitor.stop_scan()
+
+        self.assertTrue(result["running"])
+        persisted = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertTrue(persisted["active_scan"]["cancel_requested"])
+        self.assertTrue(persisted["active_scan"]["cancel_requested_at"])
+
+
+if __name__ == "__main__":
+    unittest.main()

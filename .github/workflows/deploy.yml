@@ -1,0 +1,158 @@
+name: Deploy to server
+
+run-name: Deploy ${{ github.ref_name }} at ${{ github.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_tests:
+        description: Run the test suite before deployment
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Test and deploy
+    if: ${{ github.ref == 'refs/heads/master' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production
+      url: ${{ vars.DEPLOY_PUBLIC_URL }}
+    env:
+      DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+      DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+      DEPLOY_USER: ${{ vars.DEPLOY_USER || 'root' }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+      DEPLOY_SERVICE: ${{ vars.DEPLOY_SERVICE }}
+      DEPLOY_HEALTH_URL: ${{ vars.DEPLOY_HEALTH_URL }}
+      DEPLOY_BACKUP_DIR: ${{ vars.DEPLOY_BACKUP_DIR || '/root/grok_reg_backups' }}
+      DEPLOY_BACKUP_KEEP: ${{ vars.DEPLOY_BACKUP_KEEP || '20' }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+
+    steps:
+      - name: Check out selected revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        if: ${{ inputs.run_tests }}
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+
+      - name: Install Python 3.13
+        if: ${{ inputs.run_tests }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+
+      - name: Run checks
+        if: ${{ inputs.run_tests }}
+        run: |
+          set -euo pipefail
+          uv sync --frozen
+          uv run python -m unittest discover -s tests -p 'test_*.py'
+          uv run python -m py_compile account_convert.py webui/app.py webui/store.py webui/cpa_pool.py webui/jobs.py webui/timeutil.py
+          node --check webui/static/app.js
+          python -m json.tool config.example.json >/dev/null
+
+      - name: Validate deployment configuration
+        run: |
+          set -euo pipefail
+          required=(
+            DEPLOY_HOST DEPLOY_PORT DEPLOY_USER DEPLOY_PATH DEPLOY_SERVICE
+            DEPLOY_HEALTH_URL DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS
+          )
+          for name in "${required[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing GitHub Actions configuration: ${name}"
+              exit 1
+            fi
+          done
+          [[ "$DEPLOY_PORT" =~ ^[0-9]+$ ]] || { echo "::error::DEPLOY_PORT must be numeric"; exit 1; }
+          [[ "$DEPLOY_PATH" == /* && "$DEPLOY_PATH" != "/" ]] || { echo "::error::DEPLOY_PATH must be an absolute non-root path"; exit 1; }
+          [[ "$DEPLOY_SERVICE" =~ ^[A-Za-z0-9_.@-]+$ ]] || { echo "::error::DEPLOY_SERVICE contains invalid characters"; exit 1; }
+          [[ "$DEPLOY_BACKUP_KEEP" =~ ^[0-9]+$ ]] || { echo "::error::DEPLOY_BACKUP_KEEP must be numeric"; exit 1; }
+
+      - name: Configure SSH
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" >"$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" >"$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          cat >"$HOME/.ssh/config" <<EOF
+          Host deploy-target
+            HostName ${DEPLOY_HOST}
+            Port ${DEPLOY_PORT}
+            User ${DEPLOY_USER}
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            LogLevel ERROR
+          EOF
+          chmod 600 "$HOME/.ssh/config"
+          ssh deploy-target 'printf connected'
+
+      - name: Build deployment archive
+        id: package
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/grok-reg-${GITHUB_SHA}.tar.gz"
+          remote_archive="/tmp/grok-reg-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz"
+          remote_script="/tmp/grok-reg-deploy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.sh"
+          git archive --format=tar.gz --output="$archive" "$GITHUB_SHA"
+          sha256sum "$archive"
+          echo "archive=$archive" >>"$GITHUB_OUTPUT"
+          echo "remote_archive=$remote_archive" >>"$GITHUB_OUTPUT"
+          echo "remote_script=$remote_script" >>"$GITHUB_OUTPUT"
+
+      - name: Upload release
+        run: |
+          set -euo pipefail
+          scp "${{ steps.package.outputs.archive }}" "deploy-target:${{ steps.package.outputs.remote_archive }}"
+          scp .github/scripts/deploy-remote.sh "deploy-target:${{ steps.package.outputs.remote_script }}"
+
+      - name: Deploy and verify
+        run: |
+          set -euo pipefail
+          printf -v remote_command \
+            'DEPLOY_PATH=%q DEPLOY_SERVICE=%q DEPLOY_HEALTH_URL=%q DEPLOY_BACKUP_DIR=%q DEPLOY_BACKUP_KEEP=%q RELEASE_ARCHIVE=%q DEPLOY_SHA=%q bash %q' \
+            "$DEPLOY_PATH" \
+            "$DEPLOY_SERVICE" \
+            "$DEPLOY_HEALTH_URL" \
+            "$DEPLOY_BACKUP_DIR" \
+            "$DEPLOY_BACKUP_KEEP" \
+            '${{ steps.package.outputs.remote_archive }}' \
+            "$GITHUB_SHA" \
+            '${{ steps.package.outputs.remote_script }}'
+          ssh deploy-target "$remote_command"
+
+      - name: Clean uploaded temporary files
+        if: ${{ always() }}
+        run: |
+          ssh deploy-target \
+            "rm -f -- '${{ steps.package.outputs.remote_archive }}' '${{ steps.package.outputs.remote_script }}'" \
+            2>/dev/null || true
+
+      - name: Deployment summary
+        run: |
+          {
+            echo '### Deployment completed'
+            echo
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Service: \`${DEPLOY_SERVICE}\`"
+            echo "- Target: \`${DEPLOY_PATH}\`"
+            echo "- Health check: \`${DEPLOY_HEALTH_URL}\`"
+          } >>"$GITHUB_STEP_SUMMARY"
