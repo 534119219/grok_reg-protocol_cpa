@@ -299,6 +299,33 @@ uv run python account_convert.py accounts.zip --inspect
 uv run python account_convert.py accounts.zip --to auto -o converted
 ```
 
+#### GitHub Actions 一键部署
+
+工作流：`Actions` → `Deploy to server` → `Run workflow`。默认先运行完整测试，再部署 `master`；生产任务拒绝其他分支。
+
+首次使用需要在 GitHub 仓库配置以下 Actions secrets：
+
+| Secret | 说明 |
+|--------|------|
+| `DEPLOY_SSH_KEY` | 仅用于部署的 SSH 私钥，建议使用独立 Ed25519 密钥 |
+| `DEPLOY_KNOWN_HOSTS` | 目标服务器的固定 SSH host key；工作流启用严格校验 |
+
+以及 Actions variables：
+
+| Variable | 示例 | 说明 |
+|----------|------|------|
+| `DEPLOY_HOST` | `server.example.com` | SSH 主机名或 IP |
+| `DEPLOY_PORT` | `22` | SSH 端口 |
+| `DEPLOY_USER` | `root` | 部署用户；非 root 需有免密 systemd sudo 权限 |
+| `DEPLOY_PATH` | `/root/grok_reg-protocol_cpa` | 服务器项目目录 |
+| `DEPLOY_SERVICE` | `grok-reg-webui.service` | 需要重启的 systemd 服务 |
+| `DEPLOY_HEALTH_URL` | `http://127.0.0.1:8787/healthz` | 服务器本机健康检查地址 |
+| `DEPLOY_PUBLIC_URL` | `https://example.com` | 可选，显示在 GitHub deployment 页面 |
+| `DEPLOY_BACKUP_DIR` | `/root/grok_reg_backups` | 可选，部署备份目录 |
+| `DEPLOY_BACKUP_KEEP` | `20` | 可选，保留的 Action 部署备份数量 |
+
+部署包只包含 Git 跟踪文件，不包含被 `.gitignore` 排除的账号、配置和运行状态。服务器脚本还会二次拒绝 `config.json`、`accounts_*.txt`、`mail_credentials.txt`、`cpa_auths/` 等运行态文件。每次部署会备份即将覆盖的文件，执行 `uv sync --frozen`，重启服务并轮询健康检查；失败时自动恢复备份并重启旧版本。
+
 ### 验证环境
 
 ```bash
