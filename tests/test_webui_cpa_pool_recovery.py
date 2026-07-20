@@ -63,6 +63,27 @@ class WebuiCpaPoolRecoveryTests(unittest.TestCase):
         self.assertEqual(second._next_scan_at, deadline)
         self.assertEqual(second._scheduled_interval_sec, 1800)
 
+    def test_legacy_state_derives_deadline_from_last_finish(self):
+        finished_at = "2026-07-21T02:00:00+08:00"
+        self.state_path.write_text(
+            json.dumps(
+                {
+                    "finished_at": finished_at,
+                    "summary": {"finished_at": finished_at, "counts": {}, "actions": {}},
+                    "results": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monitor = self._monitor()
+        settings = self._settings(auto_scan=True, scan_interval_sec=1800)
+
+        with mock.patch("webui.cpa_pool.settings_from_config", return_value=settings):
+            monitor.ensure_scheduler()
+
+        self.assertEqual(monitor._next_scan_at, cpa_pool._iso_to_ts(finished_at) + 1800)
+        self.assertEqual(monitor._scheduled_interval_sec, 1800)
+
     def test_disabled_auto_scan_does_not_slide_deadline(self):
         monitor = self._monitor()
         monitor._next_scan_at = 1500.0

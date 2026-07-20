@@ -463,6 +463,7 @@ class CpaPoolMonitor:
         self._progress: dict[str, Any] = {"done": 0, "total": 0}
         self._started_at = ""
         self._finished_at = ""
+        self._last_finished_ts = 0.0
         self._last_error = ""
         self._next_scan_at = 0.0
         self._scheduled_interval_sec = 0
@@ -522,7 +523,9 @@ class CpaPoolMonitor:
             history = data.get("scan_history") or []
             if isinstance(history, list):
                 self._scan_history = [_beijingize_record(dict(item)) for item in history if isinstance(item, dict)]
-            self._finished_at = timeutil.iso_to_beijing_display(data.get("finished_at")) if data.get("finished_at") else ""
+            finished_value = data.get("finished_at") or self._summary.get("finished_at") or ""
+            self._last_finished_ts = _iso_to_ts(str(finished_value))
+            self._finished_at = timeutil.iso_to_beijing_display(finished_value) if finished_value else ""
             self._started_at = str(data.get("started_at") or "")
             self._scan_id = str(data.get("scan_id") or "")
             self._last_error = str(data.get("last_error") or "")
@@ -598,7 +601,8 @@ class CpaPoolMonitor:
             self._scheduled_interval_sec = interval
             changed = True
             if not self._next_scan_at:
-                self._next_scan_at = now + interval
+                base = self._last_finished_ts or now
+                self._next_scan_at = base + interval
         elif self._scheduled_interval_sec != interval:
             self._scheduled_interval_sec = interval
             self._next_scan_at = now + interval
@@ -660,6 +664,7 @@ class CpaPoolMonitor:
             self._running = False
             self._recovery_pending = False
             self._finished_at = _utc_now()
+            self._last_finished_ts = time.time()
             self._summary.setdefault("trigger", active.get("trigger") or "manual")
             self._summary.setdefault("started_at", self._started_at)
             self._summary["done"] = int(self._progress.get("done") or self._summary.get("done") or 0)
@@ -1610,6 +1615,7 @@ class CpaPoolMonitor:
             finished_at = _utc_now()
             with self._lock:
                 self._finished_at = finished_at
+                self._last_finished_ts = time.time()
                 self._progress = dict(self._progress)
                 self._progress["done"] = int(self._progress.get("done") or self._summary.get("done") or 0)
                 self._summary.setdefault("elapsed_sec", self._elapsed_sec(fallback_started=fallback_started))
