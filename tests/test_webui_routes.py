@@ -20,6 +20,9 @@ class WebuiRouteTests(unittest.TestCase):
         response = self._response("/")
 
         self.assertEqual(Path(response.path).name, "index.html")
+        body = Path(response.path).read_text(encoding="utf-8")
+        self.assertIn('/assets/app.js', body)
+        self.assertIn('/assets/view-switch.js', body)
 
     def test_dashboard_has_its_own_path(self):
         response = self._response("/dash")
