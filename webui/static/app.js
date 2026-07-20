@@ -118,6 +118,13 @@ const TURNSTILE_SOLVER_OPTIONS = [
   ["yescaptcha", "yescaptcha — YesCaptcha 打码"],
 ];
 
+const POLICY_ACTION_OPTIONS = [
+  ["keep", "keep — 保留不处理"],
+  ["disable", "disable — 标记禁用（可恢复）"],
+  ["quarantine", "quarantine — 移入隔离区（推荐）"],
+  ["delete", "delete — 移入 deleted 隔离区"],
+];
+
 const CONFIG_FIELDS = {
   basic: [
     ["email_provider", "邮箱服务商", "select"],
@@ -206,12 +213,12 @@ const CONFIG_FIELDS = {
     ["cpa_pool_soft_fail_threshold", "软失败阈值", "number"],
     ["cpa_pool_quota_threshold", "额度冷却阈值", "number"],
     ["cpa_pool_quota_cooldown_sec", "额度禁用冷却秒", "number"],
-    ["cpa_pool_hard_bad_action", "硬坏动作 keep/disable/quarantine/delete", "text"],
-    ["cpa_pool_refresh_failed_action", "续期失败动作", "text"],
-    ["cpa_pool_invalid_action", "无效文件动作", "text"],
-    ["cpa_pool_no_grok45_action", "无4.5动作", "text"],
-    ["cpa_pool_soft_fail_action", "软失败动作", "text"],
-    ["cpa_pool_quota_action", "额度动作", "text"],
+    ["cpa_pool_hard_bad_action", "硬坏动作", "policy_action"],
+    ["cpa_pool_refresh_failed_action", "续期失败动作", "policy_action"],
+    ["cpa_pool_invalid_action", "无效文件动作", "policy_action"],
+    ["cpa_pool_no_grok45_action", "无4.5动作", "policy_action"],
+    ["cpa_pool_soft_fail_action", "软失败动作", "policy_action"],
+    ["cpa_pool_quota_action", "额度动作", "policy_action"],
     ["grok2api_auto_add_remote", "推远端 grok2api", "bool"],
     ["grok2api_remote_base", "grok2api Admin API", "text"],
     ["grok2api_remote_app_key", "grok2api app_key", "password"],
@@ -979,6 +986,16 @@ function fieldInput(key, label, type, value, isSet) {
       ? `<option value="${esc(current)}" selected>${esc(current)}（当前值）</option>`
       : "";
     return `<label><span>${esc(label)}</span><select class="select wide" data-config-key="${esc(key)}">${fallback}${options}</select></label>`;
+  }
+  if (type === "policy_action") {
+    const current = String(value ?? "keep").toLowerCase();
+    const options = POLICY_ACTION_OPTIONS.map(([v, text]) =>
+      `<option value="${esc(v)}" ${v === current ? "selected" : ""}>${esc(text)}</option>`,
+    ).join("");
+    const fallback = current && !POLICY_ACTION_OPTIONS.some(([v]) => v === current)
+      ? `<option value="${esc(current)}" selected>${esc(current)}（当前值）</option>`
+      : "";
+    return `<label><span>${esc(label)}</span><select class="select wide policy-action-select" data-config-key="${esc(key)}">${fallback}${options}</select></label>`;
   }
   if (type === "proxy") {
     const current = String(value ?? "");
