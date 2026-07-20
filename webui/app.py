@@ -12,7 +12,13 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    StreamingResponse,
+)
 from starlette.background import BackgroundTask
 
 from . import store
@@ -509,10 +515,21 @@ def create_app() -> FastAPI:
 
     @app.get("/")
     def index():
+        # 新看板(Soft UI 默认 / 漫画,同 DOM 换主题)。原始 UI 保留在 /classic。
         return FileResponse(
-            STATIC_DIR / "index.html",
+            STATIC_DIR / "dash.html",
             headers={"Cache-Control": "no-cache"},
         )
+
+    @app.get("/classic")
+    def classic():
+        # 原始 UI —— static/index.html 文件零改动;仅在响应时注入统一视图切换器脚本,
+        # 让原始视图也能一键切回 Soft UI / 漫画。
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        inject = '<script src="/assets/view-switch.js" defer></script>'
+        if inject not in html:
+            html = html.replace("</body>", f"  {inject}\n</body>", 1)
+        return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
     @app.get("/assets/{asset_path:path}")
     def assets(asset_path: str):

@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="softui">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>Grok Reg · 监控看板</title>
+<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+<script>
+/* 首屏前应用主题,避免闪烁。新看板只有 softui/comic;classic 由切换器跳转 /classic。
+   优先级:?theme= > localStorage(apc_theme)。apc_view=classic 不在本页生效(本页即新看板)。 */
+(function () {
+  var t = "";
+  try { t = new URLSearchParams(location.search).get("theme") || ""; } catch (e) {}
+  if (!t) { try { t = localStorage.getItem("apc_theme") || ""; } catch (e) {} }
+  if (t !== "comic") t = "softui";
+  document.documentElement.setAttribute("data-theme", t);
+  try { localStorage.setItem("apc_theme", t); localStorage.setItem("apc_view", t); } catch (e) {}
+})();
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Bangers&family=Comic+Neue:wght@400;700&family=ZCOOL+KuaiLe&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/assets/dash.css">
+</head>
+<body>
+<div class="wrap" id="apc-dashboard">
+
+  <!-- 顶部栏 -->
+  <div class="topbar">
+    <div class="brand">
+      <div class="logo">🛰️</div>
+      <div>
+        <h1>Grok Reg · 监控看板</h1>
+        <p>账号账本 · CPA 号池测活 · 注册/补号调度</p>
+      </div>
+    </div>
+    <div class="top-right">
+      <span class="status-chip"><span class="dot" id="healthDot"></span><span id="updated">连接中…</span></span>
+      <button type="button" class="btn" onclick="refreshAll()">⟳ 刷新</button>
+      <button type="button" class="btn primary" id="scanBtn" onclick="doScan()">▶ 立即巡检</button>
+      <div class="view-switch" id="viewSwitch" role="group" aria-label="视图切换" title="切换视图"></div>
+    </div>
+  </div>
+
+  <!-- 主视觉 + 实时状态 -->
+  <div class="grid cols-hero">
+    <div class="card" style="--tilt:-.3deg">
+      <h2>运行总览</h2>
+      <div class="hero">
+        <div class="gauge">
+          <svg width="150" height="150" viewBox="0 0 150 150" aria-hidden="true">
+            <defs>
+              <linearGradient id="gaugeGradSoft" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#2fbf71"/><stop offset="100%" stop-color="#5b6bd5"/></linearGradient>
+              <linearGradient id="gaugeGradComic" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#e23636"/><stop offset="100%" stop-color="#ffd700"/></linearGradient>
+            </defs>
+            <circle class="gauge-track" cx="75" cy="75" r="64" stroke-width="13" fill="none"></circle>
+            <circle class="gauge-arc" id="gaugeArc" cx="75" cy="75" r="64" stroke-width="13" fill="none" stroke-linecap="round" stroke-dasharray="402.12" stroke-dashoffset="402.12"></circle>
+          </svg>
+          <div class="center"><div><b id="gOk">–</b><span>可用 / CPA <i id="gTotal">–</i></span></div></div>
+        </div>
+        <div class="hero-meta">
+          <div class="hero-nums">
+            <div class="hero-line"><span class="big" id="hAccounts">–</span><span class="lbl">账号总数</span></div>
+            <div class="hero-line"><span class="big" id="hHotload">–</span><span class="lbl">热加载(可用号池)</span></div>
+            <div class="hero-line"><span class="big" id="hQuar">–</span><span class="lbl">隔离区</span></div>
+          </div>
+          <div class="healthbar"><i id="healthFill" class="fill"></i></div>
+          <div class="activity" id="activityText">—</div>
+        </div>
+      </div>
+    </div>
+    <div class="card" style="--tilt:.35deg">
+      <h2>巡检状态</h2>
+      <div class="countdown-hero"><span class="lbl">距下次自动巡检</span><b id="countdown">—</b></div>
+      <div class="kv"><span>巡检状态</span><b id="scanState">—</b></div>
+      <div class="kv"><span>本轮进度</span><b id="scanProgress">—</b></div>
+      <div class="kv"><span>上次结果</span><b id="lastSummary">—</b></div>
+      <div class="kv"><span>自动补号</span><b id="autoRefill">—</b></div>
+      <div class="kv"><span>CPA 代理</span><b id="cpaProxy">—</b></div>
+    </div>
+  </div>
+
+  <!-- 号池概览 -->
+  <div class="card" style="--tilt:-.2deg">
+    <h2>号池概览</h2>
+    <div class="stats six" id="stats"></div>
+  </div>
+
+  <!-- CPA 明细 + 调度/操作 -->
+  <div class="grid cols-2">
+    <div class="card" style="--tilt:.25deg">
+      <div class="head-row"><h2>CPA 号池明细</h2><span class="muted" id="cpaCount"></span></div>
+      <div class="tabs" id="cpaTabs"></div>
+      <div class="toolbar">
+        <div class="search"><input type="search" id="cpaSearch" placeholder="搜索邮箱 / 方法 / 位置…" autocomplete="off"></div>
+      </div>
+      <div class="tbl-scroll">
+        <table>
+          <thead><tr><th>邮箱</th><th>巡检</th><th>Mint</th><th>位置</th><th>到期</th><th>更新</th></tr></thead>
+          <tbody id="cpaBody"></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button type="button" class="btn sm" id="cpaPrev" onclick="cpaPage(-1)">上一页</button>
+        <span id="cpaPageLabel">1 / 1</span>
+        <button type="button" class="btn sm" id="cpaNext" onclick="cpaPage(1)">下一页</button>
+      </div>
+    </div>
+
+    <div class="card" style="--tilt:-.35deg">
+      <h2>号池巡检设置</h2>
+      <div class="mini" style="margin:10px 0"><label style="min-width:104px;color:var(--muted);font-weight:600">巡检周期(秒)</label><input type="number" id="setInterval" min="30" step="30"></div>
+      <div class="mini" style="margin:10px 0"><label style="min-width:104px;color:var(--muted);font-weight:600">巡检并发</label><input type="number" id="setWorkers" min="1" max="100"></div>
+      <div class="mini" style="margin:10px 0"><label style="min-width:104px;color:var(--muted);font-weight:600">补号目标活跃</label><input type="number" id="setRefillTarget" min="0"></div>
+      <div class="mini" style="margin:10px 0"><label style="min-width:104px;color:var(--muted);font-weight:600">单轮补号上限</label><input type="number" id="setRefillMax" min="1"></div>
+      <div class="pool-actions">
+        <label class="mini"><input type="checkbox" id="setAutoScan"><span>自动巡检</span></label>
+        <label class="mini"><input type="checkbox" id="setAutoRefill"><span>自动补号</span></label>
+      </div>
+      <div class="pool-actions">
+        <button type="button" class="btn primary" onclick="saveConfig()">保存设置</button>
+        <button type="button" class="btn danger" id="stopBtn" onclick="doStop()">停止巡检</button>
+      </div>
+      <div class="progress"><i class="bar" id="scanBar"></i></div>
+    </div>
+  </div>
+
+  <!-- 注册/补号 + 日志 -->
+  <div class="grid cols-2b">
+    <div class="card" style="--tilt:.3deg">
+      <h2>注册 / 补号</h2>
+      <div class="mini" style="margin:10px 0"><label style="min-width:96px;color:var(--muted);font-weight:600">新增数量</label><input type="number" id="regExtra" min="1" value="5"><span class="muted">extra</span></div>
+      <div class="mini" style="margin:10px 0"><label style="min-width:96px;color:var(--muted);font-weight:600">注册线程</label><input type="number" id="regThreads" min="1" max="100" value="4"></div>
+      <div class="ctl-row pool-actions">
+        <button type="button" class="btn primary" onclick="doRegister()">启动注册</button>
+        <button type="button" class="btn" onclick="doBackfill()">补缺失 CPA</button>
+      </div>
+      <div id="jobBox" style="margin-top:14px">
+        <div class="job-idle" id="jobIdle"><div class="big-emoji">📦</div><p>暂无运行中的任务</p><span class="muted">配置参数后点「启动注册」/「补缺失 CPA」</span></div>
+        <div id="jobDetail" hidden>
+          <div class="head-row" style="margin-bottom:8px"><span class="pill" id="jobStatus">-</span><span class="muted" id="jobKind">-</span></div>
+          <div class="job-stats" id="jobStats"></div>
+          <div class="progress"><i class="bar" id="jobBar"></i></div>
+        </div>
+      </div>
+    </div>
+    <div class="card" style="--tilt:-.3deg">
+      <div class="head-row"><h2>巡检日志</h2><span class="muted">实时</span></div>
+      <div class="log-shell"><div class="log" id="log">加载中…</div></div>
+    </div>
+  </div>
+
+</div>
+
+<div id="toast" aria-live="polite"></div>
+
+<script src="/assets/view-switch.js" defer></script>
+<script src="/assets/dash.js" defer></script>
+</body>
+</html>
