@@ -75,6 +75,8 @@ const state = {
     loading: false,
     error: "",
     requestSeq: 0,
+    cache: {},
+    fromCache: false,
   },
   jobs: [],
   activeJobId: null,
@@ -1767,7 +1769,7 @@ function renderMailReader() {
   protocol.textContent = mailToolProtocolText[reader.protocol] || reader.protocol || "未检测";
   $("#mail-reader-status").textContent = reader.loading
     ? "正在读取邮件…"
-    : (reader.error || [reader.provider, reader.checkedAt].filter(Boolean).join(" · "));
+    : (reader.error || [reader.provider, reader.checkedAt, reader.fromCache ? "缓存" : ""].filter(Boolean).join(" · "));
   $("#mail-reader-status").classList.toggle("error", Boolean(reader.error));
 
   const list = $("#mail-reader-list");
@@ -1805,16 +1807,46 @@ function renderMailReader() {
     ? `共 ${reader.total} 封邮件`
     : `本页 ${reader.items.length} 封邮件`;
   $("#mail-reader-page").textContent = `第 ${reader.page} 页`;
-  $("#mail-reader-prev").disabled = reader.loading || reader.page <= 1;
-  $("#mail-reader-next").disabled = reader.loading || !reader.hasMore;
+  $("#mail-reader-prev").disabled = reader.page <= 1;
+  $("#mail-reader-next").disabled = !reader.hasMore;
   $("#mail-reader-refresh").disabled = reader.loading;
   renderMailReaderMessage();
 }
 
-async function loadMailReaderMessages() {
+function mailReaderCacheKey(reader) {
+  const proxy = $("#mail-reader-proxy") ? $("#mail-reader-proxy").value : "";
+  return `${reader.folder}|${reader.page}|${proxy}`;
+}
+
+function applyMailReaderPayload(reader, payload, fromCache) {
+  reader.items = payload.items || [];
+  reader.total = Number(payload.total || 0);
+  reader.totalExact = Boolean(payload.total_exact);
+  reader.hasMore = Boolean(payload.has_more);
+  reader.protocol = payload.protocol || "unknown";
+  reader.provider = payload.provider || "";
+  reader.checkedAt = payload.checked_at || "";
+  reader.fromCache = fromCache;
+  reader.error = "";
+  if (!reader.items.some((item) => String(item.id) === reader.selectedId)) {
+    reader.selectedId = reader.items.length ? String(reader.items[0].id) : "";
+  }
+}
+
+async function loadMailReaderMessages({ force = false } = {}) {
   const reader = state.mailReader;
+  const key = mailReaderCacheKey(reader);
+  // 缓存命中：秒开，不发请求（仅首次打开 / 点刷新 / 未访问过的页才走网络）
+  if (!force && reader.cache[key]) {
+    const seq = ++reader.requestSeq;
+    reader.loading = false;
+    applyMailReaderPayload(reader, reader.cache[key], true);
+    renderMailReader();
+    return;
+  }
   const seq = ++reader.requestSeq;
   reader.loading = true;
+  reader.fromCache = false;
   reader.error = "";
   renderMailReader();
   try {
@@ -1828,17 +1860,9 @@ async function loadMailReaderMessages() {
         proxy_mode: $("#mail-reader-proxy").value,
       }),
     });
+    reader.cache[key] = payload;
     if (seq !== reader.requestSeq) return;
-    reader.items = payload.items || [];
-    reader.total = Number(payload.total || 0);
-    reader.totalExact = Boolean(payload.total_exact);
-    reader.hasMore = Boolean(payload.has_more);
-    reader.protocol = payload.protocol || "unknown";
-    reader.provider = payload.provider || "";
-    reader.checkedAt = payload.checked_at || "";
-    if (!reader.items.some((item) => String(item.id) === reader.selectedId)) {
-      reader.selectedId = reader.items.length ? String(reader.items[0].id) : "";
-    }
+    applyMailReaderPayload(reader, payload, false);
   } catch (err) {
     if (seq !== reader.requestSeq) return;
     reader.items = [];
@@ -1869,6 +1893,8 @@ async function openMailReader(email) {
     provider: "",
     checkedAt: "",
     error: "",
+    cache: {},
+    fromCache: false,
   });
   $("#mail-reader-proxy").value = $("#mail-tool-proxy").value;
   $("#mail-reader-dialog").showModal();
@@ -2808,11 +2834,12 @@ function bindEvents() {
     $("#mail-reader-body").textContent = "";
   });
   $("#mail-reader-refresh").addEventListener("click", () => {
-    loadMailReaderMessages().catch((err) => toast(err.message, true));
+    loadMailReaderMessages({ force: true }).catch((err) => toast(err.message, true));
   });
   $$('[data-mail-reader-folder]').forEach((button) => {
     button.addEventListener("click", () => {
-      if (state.mailReader.loading || state.mailReader.folder === button.dataset.mailReaderFolder) return;
+      // 加载中也允许切换：requestSeq 保证最后一次操作生效，缓存命中则秒开
+      if (state.mailReader.folder === button.dataset.mailReaderFolder) return;
       state.mailReader.folder = button.dataset.mailReaderFolder;
       state.mailReader.page = 1;
       state.mailReader.selectedId = "";
@@ -2833,13 +2860,13 @@ function bindEvents() {
     renderMailReader();
   });
   $("#mail-reader-prev").addEventListener("click", () => {
-    if (state.mailReader.loading || state.mailReader.page <= 1) return;
+    if (state.mailReader.page <= 1) return;
     state.mailReader.page -= 1;
     state.mailReader.selectedId = "";
     loadMailReaderMessages().catch((err) => toast(err.message, true));
   });
   $("#mail-reader-next").addEventListener("click", () => {
-    if (state.mailReader.loading || !state.mailReader.hasMore) return;
+    if (!state.mailReader.hasMore) return;
     state.mailReader.page += 1;
     state.mailReader.selectedId = "";
     loadMailReaderMessages().catch((err) => toast(err.message, true));
