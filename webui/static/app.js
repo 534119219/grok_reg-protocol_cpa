@@ -328,6 +328,31 @@ function debounce(fn, ms = 300) {
   };
 }
 
+/* 复制文本：navigator.clipboard 仅在安全上下文（HTTPS/localhost）可用，
+   HTTP 部署（如 http://IP:8787）降级为 execCommand。 */
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text);
+  }
+  return new Promise((resolve, reject) => {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.cssText = "position:fixed;top:-999px;left:-999px;opacity:0";
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, ta.value.length);
+    try {
+      const ok = document.execCommand("copy");
+      ta.remove();
+      ok ? resolve() : reject(new Error("复制失败，请手动选择复制"));
+    } catch (err) {
+      ta.remove();
+      reject(err);
+    }
+  });
+}
+
 function fmtElapsed(startedIso) {
   if (!startedIso) return "00:00";
   const start = Date.parse(startedIso);
@@ -2749,7 +2774,7 @@ function bindEvents() {
   $("#mail-tool-rows").addEventListener("click", (e) => {
     const copy = e.target.closest("[data-copy-mail-code]");
     if (copy) {
-      navigator.clipboard.writeText(copy.dataset.copyMailCode)
+      copyText(copy.dataset.copyMailCode)
         .then(() => toast("验证码已复制"))
         .catch((err) => toast(err.message, true));
       return;
@@ -2874,7 +2899,7 @@ function bindEvents() {
   $("#mail-reader-copy-code").addEventListener("click", () => {
     const code = selectedMailReaderMessage()?.code;
     if (!code) return;
-    navigator.clipboard.writeText(code)
+    copyText(code)
       .then(() => toast("验证码已复制"))
       .catch((err) => toast(err.message, true));
   });
