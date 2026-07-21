@@ -726,9 +726,14 @@ class CpaPoolMonitor:
                     }
                 encoded = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
                 STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-                tmp = STATE_PATH.with_name(f".{STATE_PATH.name}.tmp")
-                tmp.write_text(encoded, encoding="utf-8")
-                os.replace(tmp, STATE_PATH)
+                tmp = STATE_PATH.with_name(
+                    f".{STATE_PATH.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+                )
+                try:
+                    tmp.write_text(encoded, encoding="utf-8")
+                    os.replace(tmp, STATE_PATH)
+                finally:
+                    tmp.unlink(missing_ok=True)
             return True
         except Exception:
             return False
