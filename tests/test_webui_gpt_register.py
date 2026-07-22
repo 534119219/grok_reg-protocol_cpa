@@ -81,3 +81,77 @@ class WebuiGptRegisterRetryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GptRegisterFlowMailTimingTests(unittest.TestCase):
+    def test_run_async_passes_authorize_time_to_mail_reader(self):
+        import asyncio
+        import gpt_register_flow as gpt
+
+        class Resp:
+            def __init__(self, status_code=200, payload=None, text="{}", headers=None):
+                self.status_code = status_code
+                self._payload = payload or {}
+                self.text = text
+                self.headers = headers or {}
+
+            def json(self):
+                return self._payload
+
+        class CookieJar:
+            jar = []
+
+        class FakeSession:
+            def __init__(self, **kwargs):
+                self.cookies = CookieJar()
+                self.get_calls = 0
+
+            async def get(self, url, **kwargs):
+                self.get_calls += 1
+                if url.endswith("/api/auth/csrf"):
+                    return Resp(payload={"csrfToken": "csrf"})
+                if "authorize" in url:
+                    return Resp(status_code=302, headers={"location": ""})
+                if url.endswith("/api/auth/session"):
+                    return Resp(payload={"accessToken": "tok", "account": {"id": "acc"}})
+                return Resp()
+
+            async def post(self, url, **kwargs):
+                if "signin/openai" in url:
+                    return Resp(payload={"url": "https://auth.openai.com/api/accounts/authorize"})
+                if "email-otp/validate" in url:
+                    return Resp(payload={"continue_url": "https://auth.openai.com/about-you"})
+                if "create_account" in url:
+                    return Resp(payload={"continue_url": "https://chatgpt.com/api/auth/callback/openai"})
+                return Resp()
+
+            async def close(self):
+                return None
+
+        class FakeSentinel:
+            def __init__(self, **kwargs):
+                pass
+            async def get_token(self, *args):
+                return {"token": "t"}
+            async def get_so_token(self, *args):
+                return {"token": "s"}
+
+        seen = []
+        def get_code(issued_after):
+            seen.append(issued_after)
+            return "123456"
+
+        with (
+            mock.patch("curl_cffi.requests.AsyncSession", FakeSession),
+            mock.patch("sentinel_token.SentinelTokenProvider", FakeSentinel),
+            mock.patch.object(gpt.time, "time", side_effect=[1000.0, 1001.0, 1002.0]),
+        ):
+            result = asyncio.run(gpt._run_async(
+                email="u@example.com", proxy=None, get_code=get_code,
+                name="Test User", birthdate="1990-01-01", otp_timeout=30,
+                impersonate="firefox144", probe=True, log=lambda m: None,
+                cancel=lambda: False, on_stage=lambda s: None,
+            ))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(seen, [1000.0])

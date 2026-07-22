@@ -114,7 +114,7 @@ async def _run_async(
     *,
     email: str,
     proxy: str | None,
-    get_code: Callable[[], str],
+    get_code: Callable[[float], str],
     name: str,
     birthdate: str,
     otp_timeout: float,
@@ -203,7 +203,7 @@ async def _run_async(
 
         # ── 2. 收码（同步阻塞收码函数放到线程）──
         _check_cancel(cancel)
-        code = await asyncio.to_thread(get_code)
+        code = await asyncio.to_thread(get_code, otp_sent_at)
         code = re.sub(r"\D", "", str(code or ""))[:6] or str(code or "").strip()
         if not code:
             raise GptRegisterError("otp", "验证码为空")
@@ -353,7 +353,7 @@ def run_gpt_register(
     name = name or gen_name
     birthdate = birthdate or gen_bd
 
-    def get_code() -> str:
+    def get_code(issued_after: float | None = None) -> str:
         import grok_register_ttk as reg
 
         domain = email.split("@", 1)[1] if "@" in email else ""
@@ -364,6 +364,7 @@ def run_gpt_register(
                 timeout=otp_timeout,
                 log_callback=log,
                 cancel_callback=cancel,
+                issued_after=issued_after,
             )
             reg.cf_note_otp_success(domain)
             return code
