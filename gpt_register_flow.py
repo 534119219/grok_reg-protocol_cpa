@@ -361,12 +361,16 @@ def run_gpt_register(
         _save_account(email, password, result.get("access_token", ""), result.get("session_data") or {}, log)
 
         access_token = result.get("access_token", "")
-        # Agent 身份（默认开启）
-        if access_token and cfg.get("gpt_agent_enabled", True):
+        need_agent = bool(cfg.get("gpt_agent_enabled", True)) or (
+            bool(cfg.get("sub2api_enabled"))
+            and str(cfg.get("sub2api_format") or "agent").lower() == "agent"
+        )
+        auth_json = None
+        if access_token and need_agent:
             try:
                 import gpt_agent
 
-                gpt_agent.create_agent_identity(
+                auth_json = gpt_agent.create_agent_identity(
                     access_token, email=email, proxy=proxy, log=log
                 )
             except Exception as exc:
@@ -382,6 +386,7 @@ def run_gpt_register(
                     email=email,
                     access_token=access_token,
                     cfg=cfg,
+                    auth_json=auth_json,
                     proxy=proxy,
                     log=log,
                 )

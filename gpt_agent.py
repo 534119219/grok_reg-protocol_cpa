@@ -218,10 +218,16 @@ def push_to_sub2api(
     email: str,
     access_token: str,
     cfg: dict[str, Any],
+    auth_json: dict[str, Any] | None = None,
     proxy: str | None = None,
     log: LogFn | None = None,
 ) -> dict[str, Any]:
-    """把 GPT 账号推送到 sub2api（x-api-key 认证，支持指定分组）。"""
+    """把 GPT 账号推送到 sub2api（x-api-key 认证，支持指定分组）。
+
+    sub2api_format = agent（默认）: credentials 用 Agent Identity auth.json
+    （agent_runtime_id + Ed25519 私钥，长期有效，不依赖 session 过期时间）
+    sub2api_format = oauth: credentials 用 session access_token（JWT，随 session 过期）
+    """
     from curl_cffi import requests as creq
 
     log = log or _noop
@@ -232,32 +238,43 @@ def push_to_sub2api(
 
     group_id = _resolve_group_id(base, api_key, str(cfg.get("sub2api_group_id") or ""), proxy, log)
 
-    account = sess_data.get("account") or {}
-    info = session_info_from_token(access_token)
-    expires_at = ""
-    exp = info.get("exp")
-    if exp:
-        expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(exp))
-    credentials: dict[str, Any] = {
-        "access_token": access_token,
-        "expires_at": expires_at or sess_data.get("expires", ""),
-        "email": email,
-        "plan_type": account.get("planType", "free"),
-    }
-    session_token = sess_data.get("sessionToken", "")
-    if session_token:
-        credentials["refresh_token"] = session_token
-    if account.get("id"):
-        credentials["chatgpt_account_id"] = account["id"]
-    if info.get("user_id"):
-        credentials["chatgpt_user_id"] = info["user_id"]
+    fmt = str(cfg.get("sub2api_format") or "agent").strip().lower()
+    if fmt == "agent":
+        if not auth_json:
+            raise RuntimeError("sub2api_format=agent 需要 auth_json（Agent Identity）")
+        identity = dict(auth_json.get("agent_identity") or {})
+        identity["email"] = email
+        credentials = {
+            "auth_mode": "agent_identity",
+            "agent_identity": identity,
+        }
+    else:
+        account = sess_data.get("account") or {}
+        info = session_info_from_token(access_token)
+        expires_at = ""
+        exp = info.get("exp")
+        if exp:
+            expires_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(exp))
+        credentials = {
+            "access_token": access_token,
+            "expires_at": expires_at or sess_data.get("expires", ""),
+            "email": email,
+            "plan_type": account.get("planType", "free"),
+        }
+        session_token = sess_data.get("sessionToken", "")
+        if session_token:
+            credentials["refresh_token"] = session_token
+        if account.get("id"):
+            credentials["chatgpt_account_id"] = account["id"]
+        if info.get("user_id"):
+            credentials["chatgpt_user_id"] = info["user_id"]
 
     body = {
         "name": email,
         "platform": "openai",
         "type": "oauth",
         "credentials": credentials,
-        "extra": {"email": email, "source": "gpt_register"},
+        "extra": {"email": email, "source": "gpt_register", "format": fmt},
         "concurrency": int(cfg.get("sub2api_concurrency", 10) or 10),
         "priority": int(cfg.get("sub2api_priority", 1) or 1),
         "group_ids": [group_id] if group_id else [],
@@ -273,7 +290,7 @@ def push_to_sub2api(
     )
     if r.status_code not in (200, 201):
         raise RuntimeError(f"sub2api 推送失败 HTTP {r.status_code}: {r.text[:200]}")
-    log(f"[*] sub2api 推送成功: {email}（group={group_id or '默认'}）")
+    log(f"[*] sub2api 推送成功: {email}（{fmt} 格式，group={group_id or '默认'}）")
     return r.json()
 
 
