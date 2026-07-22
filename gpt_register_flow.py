@@ -274,66 +274,71 @@ async def _run_async(
         log("5. OTP 校验通过")
         on_stage("otp_ready")
 
-        # ── 4. about-you 页面上下文 ──
-        about_you_url = continue_url_v
-        if "create-account/password" in about_you_url:
+        create_data: dict[str, Any] = {}
+        if "/api/auth/callback" in continue_url_v:
+            # 邮箱在 OpenAI 侧已有账户（历史任务建过号但没落账）：
+            # validate 直接返回 callback 地址（page.type=external_url），
+            # 跳过 about-you / create_account 直接恢复会话，避免 invalid_auth_step。
+            log("5b. 邮箱已有账户，跳过 create_account 直接恢复会话")
+            create_data = {"continue_url": continue_url_v}
+        elif "create-account/password" in continue_url_v:
             # OTP 后仍要求设密码的灰度变体：本流程暂不支持，明确失败让任务换会话重试。
             raise GptRegisterError("validate", "OTP 后仍要求创建密码（灰度变体），换会话重试")
-        if about_you_url:
+        else:
+            # ── 4. about-you 页面上下文 ──
             try:
-                await session.get(about_you_url, headers={"referer": f"{AUTH_BASE}/email-verification"})
+                await session.get(continue_url_v, headers={"referer": f"{AUTH_BASE}/email-verification"})
             except Exception as exc:
                 log(f"[Debug] about-you 访问失败（继续）: {exc}")
 
-        # ── 5. create_account（纯算法 sentinel 头，registration_disallowed 重试 3 次）──
-        _check_cancel(cancel)
-        create_data: dict[str, Any] = {}
-        for attempt in range(1, 4):
-            headers = {
-                "accept": "application/json",
-                "content-type": "application/json",
-                "referer": f"{AUTH_BASE}/about-you",
-                "origin": AUTH_BASE,
-            }
-            token = await sentinel.get_token("oauth_create_account", device_id)
-            if token:
-                headers["openai-sentinel-token"] = json.dumps(token)
-            so_token = await sentinel.get_so_token("oauth_create_account", device_id)
-            if so_token:
-                headers["openai-sentinel-so-token"] = json.dumps(so_token)
-            log(f"6. create_account（sentinel 已生成，第 {attempt} 次）")
-            resp = await session.post(
-                f"{AUTH_BASE}/api/accounts/create_account",
-                json={"name": name, "birthdate": birthdate},
-                headers=headers,
-            )
-            try:
-                create_data = resp.json()
-            except Exception:
-                create_data = {"status": resp.status_code, "text": resp.text}
-            err = (create_data.get("error") or {}) if isinstance(create_data, dict) else {}
-            err_code = str(err.get("code") or "")
-            if err_code == "registration_disallowed" and attempt < 3:
-                log(f"[!] registration_disallowed，2s 后重试 ({attempt}/3)")
-                await asyncio.sleep(2)
-                continue
-            if err_code:
-                # 仅 registration_disallowed（OpenAI 业务拒绝）才冷却域名；
-                # 网络错误/sentinel/OTP 问题不触发，避免误伤。
-                if err_code == "registration_disallowed":
-                    try:
-                        import grok_register_ttk as reg
+            # ── 5. create_account（纯算法 sentinel 头，registration_disallowed 重试 3 次）──
+            _check_cancel(cancel)
+            for attempt in range(1, 4):
+                headers = {
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    "referer": f"{AUTH_BASE}/about-you",
+                    "origin": AUTH_BASE,
+                }
+                token = await sentinel.get_token("oauth_create_account", device_id)
+                if token:
+                    headers["openai-sentinel-token"] = json.dumps(token)
+                so_token = await sentinel.get_so_token("oauth_create_account", device_id)
+                if so_token:
+                    headers["openai-sentinel-so-token"] = json.dumps(so_token)
+                log(f"6. create_account（sentinel 已生成，第 {attempt} 次）")
+                resp = await session.post(
+                    f"{AUTH_BASE}/api/accounts/create_account",
+                    json={"name": name, "birthdate": birthdate},
+                    headers=headers,
+                )
+                try:
+                    create_data = resp.json()
+                except Exception:
+                    create_data = {"status": resp.status_code, "text": resp.text}
+                err = (create_data.get("error") or {}) if isinstance(create_data, dict) else {}
+                err_code = str(err.get("code") or "")
+                if err_code == "registration_disallowed" and attempt < 3:
+                    log(f"[!] registration_disallowed，2s 后重试 ({attempt}/3)")
+                    await asyncio.sleep(2)
+                    continue
+                if err_code:
+                    # 仅 registration_disallowed（OpenAI 业务拒绝）才冷却域名；
+                    # 网络错误/sentinel/OTP 问题不触发，避免误伤。
+                    if err_code == "registration_disallowed":
+                        try:
+                            import grok_register_ttk as reg
 
-                        reg.mark_cf_domain_cooldown(
-                            email.split("@", 1)[1] if "@" in email else email,
-                            log_callback=log,
-                        )
-                    except Exception:
-                        pass
-                raise GptRegisterError("create_account", f"{err_code}: {str(err)[:200]}")
-            break
-        else:
-            raise GptRegisterError("create_account", "registration_disallowed（3 次重试均失败）")
+                            reg.mark_cf_domain_cooldown(
+                                email.split("@", 1)[1] if "@" in email else email,
+                                log_callback=log,
+                            )
+                        except Exception:
+                            pass
+                    raise GptRegisterError("create_account", f"{err_code}: {str(err)[:200]}")
+                break
+            else:
+                raise GptRegisterError("create_account", "registration_disallowed（3 次重试均失败）")
         on_stage("sentinel_ready")
 
         # ── 6. callback → session ──
