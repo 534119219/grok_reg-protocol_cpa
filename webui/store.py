@@ -867,6 +867,7 @@ PUBLIC_CONFIG_KEYS = [
     "sub2api_priority",
     "hotmail_accounts_file",
     "hotmail_protocol",
+    "hotmail_graph_folders",
     "hotmail_alias_mode",
     "hotmail_alias_random_length",
     "hotmail_max_aliases_per_account",

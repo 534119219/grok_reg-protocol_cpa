@@ -73,6 +73,8 @@ DEFAULT_CONFIG = {
     "hotmail_require_recipient_match": True,
     # auto: 按凭证授权自动探测（IMAP scope refresh + XOAUTH2 试登录）；imap/graph: 强制
     "hotmail_protocol": "auto",
+    # Graph 收码扫描的文件夹（ChatGPT 验证码常落 Junk）
+    "hotmail_graph_folders": "inbox,junkemail",
     # 注册阶段协议路径：curl_cffi 重放 accounts.x.ai 注册请求拿 SSO；失败可回退浏览器。
     "protocol_register": False,
     "protocol_only": False,
@@ -1974,7 +1976,12 @@ def _hotmail_is_alias_of_main(email_addr, main_email):
     main_local, main_domain = _hotmail_split_email_addr(main_email)
     if not local or not main_local or domain != main_domain:
         return False
-    return local == main_local or local.startswith(main_local + "+")
+    if local == main_local:
+        return True
+    # 凭证本身可能已含 + 别名（如 user+HAaBDZ@outlook.de），
+    # 按第一个 + 之前的基础名判断归属，避免漏计/错计配额。
+    base = main_local.split("+", 1)[0]
+    return local.startswith(base + "+")
 
 
 def _hotmail_iter_tracked_emails():
@@ -2028,9 +2035,12 @@ def _hotmail_make_alias(main_email, alias_index, *, randomize=False):
     if alias_index <= 0:
         return main_email
     local, domain = main_email.split("@", 1)
+    # 凭证已含 + 别名时，回退到基础名再生成单层别名：
+    # 双层 plus（user+a+b@）在微软/发件方侧经常收不到信。
+    base = local.split("+", 1)[0]
     if randomize:
-        return f"{local}+{_hotmail_random_suffix(local)}@{domain}"
-    return f"{local}+{alias_index}@{domain}"
+        return f"{base}+{_hotmail_random_suffix(base)}@{domain}"
+    return f"{base}+{alias_index}@{domain}"
 
 
 def hotmail_get_email_and_token():
@@ -2512,19 +2522,35 @@ def hotmail_graph_get_code(mailbox_email, target_email, access_token, log_callba
 
     if log_callback:
         log_callback(f"[Debug] Hotmail/Outlook Graph 拉取邮件: user={mailbox_email}")
-    url = (
-        "https://graph.microsoft.com/v1.0/me/messages"
-        f"?$top={max(1, last_n)}&$orderby=receivedDateTime desc"
-        "&$select=subject,from,receivedDateTime,toRecipients,ccRecipients,body"
-    )
-    resp = http_get(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
-    if resp.status_code in (401, 403):
-        raise Exception(f"Graph 鉴权失败 HTTP {resp.status_code}")
-    if resp.status_code != 200:
-        raise Exception(f"Graph 拉取邮件失败 HTTP {resp.status_code}: {resp.text[:200]}")
-    data = resp.json()
+    # ChatGPT/xAI 的验证码邮件经常落进垃圾邮件文件夹，INBOX + Junk 都要扫
+    raw_folders = str(config.get("hotmail_graph_folders", "inbox,junkemail") or "inbox,junkemail")
+    folders = [f.strip() for f in raw_folders.replace("，", ",").split(",") if f.strip()] or ["inbox", "junkemail"]
+    messages: list[dict] = []
+    seen_ids: set[str] = set()
+    select = "subject,from,receivedDateTime,toRecipients,ccRecipients,body"
+    for folder in folders:
+        url = (
+            f"https://graph.microsoft.com/v1.0/me/mailFolders/{folder}/messages"
+            f"?$top={max(1, last_n)}&$orderby=receivedDateTime desc&$select={select}"
+        )
+        resp = http_get(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
+        if resp.status_code in (401, 403):
+            raise Exception(f"Graph 鉴权失败 HTTP {resp.status_code}")
+        if resp.status_code != 200:
+            if log_callback:
+                log_callback(f"[Debug] Graph {folder} 拉取失败 HTTP {resp.status_code}，跳过")
+            continue
+        for message in resp.json().get("value", []) or []:
+            mid = str(message.get("id") or "")
+            if mid and mid in seen_ids:
+                continue
+            if mid:
+                seen_ids.add(mid)
+            message["_folder"] = folder
+            messages.append(message)
 
-    for message in data.get("value", []) or []:
+    messages.sort(key=lambda m: str(m.get("receivedDateTime") or ""), reverse=True)
+    for message in messages:
         received = message.get("receivedDateTime") or ""
         if received:
             try:
