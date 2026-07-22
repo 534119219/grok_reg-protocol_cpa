@@ -1518,14 +1518,6 @@ const GPT_EXTRA_FIELDS = [
 GPT_EXTRA_FIELDS.forEach(([k, l, t]) => { if (!FIELD_MAP[k]) FIELD_MAP[k] = [k, l, t]; });
 
 const PAGE_SETTINGS = {
-  gpt: {
-    title: "GPT 注册配置",
-    eyebrow: "GPT CONFIG",
-    groups: [
-      ["Agent 身份", ["gpt_agent_enabled"]],
-      ["sub2api 推送", ["sub2api_enabled", "sub2api_base", "sub2api_api_key", "sub2api_group_id", "sub2api_concurrency", "sub2api_priority"]],
-    ],
-  },
   console: {
     title: "注册流程配置",
     eyebrow: "CONSOLE CONFIG",
@@ -1542,6 +1534,8 @@ const PAGE_SETTINGS = {
       ["邮箱与收码", ["email_provider", "hotmail_accounts_file", "hotmail_protocol", "mail_timeout", "mail_poll_interval", "mail_retry_count"]],
       ["浏览器与代理", ["register_headless", "register_threads", "thread_start_interval", "proxy", "browser_timezone", "user_agent"]],
       ["Solver 预留", ["turnstile_solver_provider", "protocol_solver_url", "protocol_solver_pass_proxy", "protocol_solver_locale", "protocol_solver_accept_language", "protocol_solver_timezone"]],
+      ["Agent 身份", ["gpt_agent_enabled"]],
+      ["sub2api 推送", ["sub2api_enabled", "sub2api_base", "sub2api_api_key", "sub2api_group_id", "sub2api_concurrency", "sub2api_priority"]],
     ],
   },
   mail: {
