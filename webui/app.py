@@ -25,6 +25,7 @@ from starlette.background import BackgroundTask
 from . import store
 from . import timeutil
 from .cpa_pool import monitor as cpa_pool_monitor
+from .gpt_register import flow_summary as gpt_register_flow_summary
 from .jobs import runner
 from .mail_tools import mail_tool_manager
 
@@ -118,6 +119,10 @@ def create_app() -> FastAPI:
         data["active_job"] = active.public_dict() if active else None
         data["jobs"] = runner.list_jobs()[:10]
         return data
+
+    @app.get("/api/gpt/register/flow")
+    def gpt_register_flow() -> dict[str, Any]:
+        return gpt_register_flow_summary()
 
     @app.get("/api/accounts")
     def accounts(
@@ -413,6 +418,14 @@ def create_app() -> FastAPI:
         job = runner.start_register(body)
         return JSONResponse(job, status_code=202)
 
+    @app.post("/api/jobs/gpt-register")
+    async def job_gpt_register(request: Request) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("body 必须是对象")
+        job = runner.start_gpt_register(body)
+        return JSONResponse(job, status_code=202)
+
     @app.post("/api/jobs/backfill")
     async def job_backfill(request: Request) -> JSONResponse:
         body = await request.json()
@@ -648,6 +661,13 @@ def create_app() -> FastAPI:
             STATIC_DIR / "dash.html",
             headers={"Cache-Control": "no-cache"},
         )
+
+    @app.get("/gpt")
+    def gpt_workbench():
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        boot = '<script>if (!location.hash) location.hash = "#gpt";</script>'
+        html = html.replace('<script src="/assets/app.js" defer></script>', f"{boot}\n  <script src=\"/assets/app.js\" defer></script>", 1)
+        return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
     @app.get("/classic")
     def classic():
