@@ -188,7 +188,7 @@ def create_agent_identity(
 
 
 def _resolve_group_id(base: str, api_key: str, group: str, proxy: str | None, log: LogFn) -> int | None:
-    """group 为数字直接用；为名称时查 /admin/groups/all 解析。"""
+    """group 为数字直接用；为名称时查 /api/v1/admin/groups/all 解析。"""
     group = (group or "").strip()
     if not group:
         return None
@@ -199,7 +199,7 @@ def _resolve_group_id(base: str, api_key: str, group: str, proxy: str | None, lo
     kwargs: dict[str, Any] = {"impersonate": "chrome", "timeout": 15}
     if proxy:
         kwargs["proxies"] = {"http": proxy, "https": proxy}
-    r = creq.get(f"{base}/admin/groups/all", headers={"x-api-key": api_key}, **kwargs)
+    r = creq.get(f"{base}/api/v1/admin/groups/all", headers={"x-api-key": api_key}, **kwargs)
     if r.status_code != 200:
         raise RuntimeError(f"查询分组失败 HTTP {r.status_code}")
     data = r.json()
@@ -266,7 +266,7 @@ def push_to_sub2api(
     if proxy:
         kwargs["proxies"] = {"http": proxy, "https": proxy}
     r = creq.post(
-        f"{base}/admin/accounts",
+        f"{base}/api/v1/admin/accounts",
         headers={"x-api-key": api_key, "Content-Type": "application/json"},
         json=body,
         **kwargs,
