@@ -218,7 +218,13 @@ async def _run_async(
         )
         if resp.status_code != 200:
             raise GptRegisterError("validate", f"HTTP {resp.status_code}: {resp.text[:200]}")
-        validate_data = resp.json()
+        try:
+            validate_data = resp.json()
+        except Exception as exc:
+            raise GptRegisterError(
+                "validate",
+                f"OTP validate 返回非 JSON: HTTP {resp.status_code}: {resp.text[:200]}",
+            ) from exc
         if isinstance(validate_data, dict) and validate_data.get("error"):
             raise GptRegisterError("validate", str(validate_data["error"])[:200])
         log("5. OTP 校验通过")

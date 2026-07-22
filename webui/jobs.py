@@ -130,17 +130,49 @@ def _gpt_should_retry_error(reg_module: Any, reason: str) -> bool:
     return True
 
 
-def _mark_gpt_email_failure(reg_module: Any, email: str, reason: str) -> None:
-    """Persist only hard mailbox failures; transient GPT flow failures release the alias."""
+def _mark_gpt_email_failure(
+    reg_module: Any,
+    email: str,
+    reason: str,
+    *,
+    hold_transient: bool = False,
+) -> str:
+    """Handle a failed GPT email attempt.
+
+    Hard mailbox/auth failures are persisted. Transient GPT-flow failures may be
+    kept reserved for the current job so the retry loop does not immediately
+    pick the same alias and then reuse old OTPs.
+    """
     if not email:
-        return
+        return "none"
     try:
         if bool(reg_module.should_persist_email_error(reason)):
             reg_module.mark_error(email, reason=str(reason)[:120])
-        else:
-            reg_module.release_email(email)
+            return "persisted"
+        if hold_transient:
+            return "held"
+        reg_module.release_email(email)
+        return "released"
     except Exception:
-        pass
+        return "error"
+
+
+def _release_gpt_held_emails(reg_module: Any, emails: set[str]) -> None:
+    for email in list(emails):
+        try:
+            reg_module.release_email(email)
+        except Exception:
+            pass
+        else:
+            emails.discard(email)
+
+
+def _forget_gpt_held_email(emails: set[str], email: str) -> None:
+    if email:
+        try:
+            emails.discard(str(email).strip().lower())
+        except Exception:
+            pass
 
 
 def resolve_backfill_workers(options: dict[str, Any], config: dict[str, Any]) -> int:
@@ -746,6 +778,8 @@ class JobRunner:
         job.started_at = _utc_now()
         job.append_log("GPT 注册任务启动（协议优先 + 浏览器 sentinel 接力）")
         cancel = job.cancel_event.is_set
+        held_transient_emails: set[str] = set()
+        held_transient_lock = threading.Lock()
         try:
             reg.load_config()
             cfg = dict(getattr(reg, "config", {}) or {})
@@ -858,14 +892,30 @@ class JobRunner:
                                     reg.mark_used(email, "")
                                 except Exception:
                                     pass
+                                with held_transient_lock:
+                                    _forget_gpt_held_email(held_transient_emails, email)
                                 break
                             last_error = str(result.get("error", "") or "GPT 注册未成功")
-                            _mark_gpt_email_failure(reg, email, last_error)
+                            action = _mark_gpt_email_failure(
+                                reg, email, last_error, hold_transient=True
+                            )
                         except Exception as exc:
                             last_error = str(exc)
-                            _mark_gpt_email_failure(reg, email, last_error)
+                            action = _mark_gpt_email_failure(
+                                reg, email, last_error, hold_transient=True
+                            )
                         finally:
                             reg.clear_thread_proxy()
+
+                        if email:
+                            email_key = str(email).strip().lower()
+                            with held_transient_lock:
+                                if action == "held":
+                                    held_transient_emails.add(email_key)
+                                    if mail_try < max_mail_retry:
+                                        log(f"[retry] 暂存本轮失败邮箱，避免立刻复用旧验证码: {email}")
+                                else:
+                                    _forget_gpt_held_email(held_transient_emails, email)
 
                         if cancel():
                             break
@@ -911,6 +961,10 @@ class JobRunner:
             job.append_log(f"GPT 注册任务异常: {exc}")
             traceback.print_exc()
             self._finish(job, "failed", str(exc))
+        finally:
+            with held_transient_lock:
+                if held_transient_emails:
+                    _release_gpt_held_emails(reg, held_transient_emails)
 
     def _run_backfill(self, job: Job) -> None:
         from cpa_xai import existing_cpa_emails, mint_and_export, parse_accounts_file
