@@ -3082,6 +3082,7 @@ class CpaPoolMonitor:
             snapshot_ready = bool(active.get("snapshot_ready"))
             index = [dict(item) for item in (active.get("items") or []) if isinstance(item, dict)]
             initial_total = _coerce_int(active.get("initial_total"), 0, min_v=0)
+            adaptive = bool(options.get("adaptive")) and trigger == "auto"
         self._log(
             f"CPA 巡检{'恢复执行' if resume else '开始'}：id={scan_id} trigger={trigger} "
             f"workers={settings['scan_workers']} probe_chat={settings['probe_chat']} "
@@ -3093,7 +3094,6 @@ class CpaPoolMonitor:
                 inventory = store.list_cpa_index()
                 initial_total = len(inventory)
                 states = self._sync_inventory_states(inventory)
-                adaptive = bool(options.get("adaptive")) and trigger == "auto"
                 emails = {str(e).strip().lower() for e in (options.get("emails") or []) if str(e).strip()}
                 if emails:
                     selected_emails = [email for email in inventory if email in emails]
@@ -3105,6 +3105,16 @@ class CpaPoolMonitor:
                         max_v=10000,
                     )
                     selected_emails = self._repo().due_emails(now=time.time(), limit=adaptive_limit)
+                    missing_due = [email for email in selected_emails if email not in inventory]
+                    if missing_due:
+                        deleted = self._repo().delete_accounts(missing_due)
+                        preview = ", ".join(missing_due[:3])
+                        suffix = f"：{preview}" if preview else ""
+                        self._log(f"CPA 巡检：清理 {deleted} 个已不在库存的历史到期状态{suffix}")
+                        with self._lock:
+                            for email in missing_due:
+                                self._results.pop(email, None)
+                        selected_emails = [email for email in selected_emails if email in inventory]
                 else:
                     selected_emails = list(inventory)
                 index = [dict(inventory[email]) for email in selected_emails if email in inventory]
@@ -3310,7 +3320,10 @@ class CpaPoolMonitor:
                     }
                 )
             if total == 0:
-                self._log("CPA 巡检：没有可检查的 xai-*.json")
+                if adaptive and initial_total > 0:
+                    self._log(f"CPA 巡检：当前没有到期账号，库存 {initial_total} 个，等待分层周期")
+                else:
+                    self._log("CPA 巡检：没有可检查的 xai-*.json")
             elif self._cancel.is_set():
                 self._log(f"CPA 巡检已取消：done={done}/{total} elapsed={elapsed}s")
             else:

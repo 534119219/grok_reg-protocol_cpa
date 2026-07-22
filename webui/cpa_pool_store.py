@@ -178,6 +178,15 @@ class PoolStateDB:
                 values.append(value)
         return values
 
+    def delete_accounts(self, emails: list[str] | set[str] | tuple[str, ...]) -> int:
+        normalized = sorted({str(email or "").strip().lower() for email in emails if str(email or "").strip()})
+        if not normalized:
+            return 0
+        self.initialize()
+        with self._connection() as conn:
+            cursor = conn.executemany("DELETE FROM account_state WHERE email=?", [(email,) for email in normalized])
+        return max(0, int(cursor.rowcount or 0))
+
     def due_emails(self, *, now: float, limit: int) -> list[str]:
         self.initialize()
         query = "SELECT email FROM account_state WHERE next_check_at > 0 AND next_check_at <= ? ORDER BY next_check_at, email"

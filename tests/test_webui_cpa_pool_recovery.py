@@ -204,6 +204,44 @@ class WebuiCpaPoolRecoveryTests(unittest.TestCase):
         persisted = json.loads(self.state_path.read_text(encoding="utf-8"))
         self.assertIsNone(persisted["active_scan"])
 
+    def test_auto_scan_prunes_due_state_for_files_no_longer_in_inventory(self):
+        monitor = self._monitor()
+        now = time.time()
+        stale = cpa_pool.default_state("stale@example.com", path="/tmp/missing-xai-stale.json", now=now)
+        stale.update({"tier": "main", "health_status": "healthy", "next_check_at": now - 60, "updated_at": now})
+        active = cpa_pool.default_state("active@example.com", path="/tmp/xai-active.json", now=now)
+        active.update({"tier": "main", "health_status": "healthy", "next_check_at": now + 3600, "updated_at": now})
+        monitor._repo().upsert_accounts([stale, active])
+        settings = self._settings(auto_scan=True, scan_workers=1)
+        inventory = {
+            "active@example.com": {
+                "email": "active@example.com",
+                "path": "/tmp/xai-active.json",
+                "location": "auth_dir",
+                "disabled": False,
+                "priority": 100,
+                "pool_managed": True,
+            }
+        }
+
+        with (
+            mock.patch("webui.cpa_pool.settings_from_config", return_value=settings),
+            mock.patch("webui.cpa_pool.store.list_cpa_index", return_value=inventory),
+            mock.patch.object(monitor, "_maybe_start_refill", return_value={"enabled": False, "started": False}),
+            mock.patch.object(monitor, "quarantine_summary", return_value={"total": 0}),
+        ):
+            result = monitor.start_scan({"trigger": "auto", "adaptive": True})
+            self.assertTrue(result["started"])
+            monitor._scan_thread.join(timeout=5)
+
+        self.assertFalse(monitor._scan_thread.is_alive())
+        self.assertIsNone(monitor._repo().get_account("stale@example.com"))
+        self.assertIsNotNone(monitor._repo().get_account("active@example.com"))
+        self.assertEqual(monitor._summary["total"], 0)
+        joined_logs = "\n".join(monitor._logs)
+        self.assertIn("清理 1 个已不在库存的历史到期状态", joined_logs)
+        self.assertIn("当前没有到期账号，库存 1 个", joined_logs)
+
     def _persist_interrupted_scan(self, *, trigger: str, cancel_requested: bool = False) -> None:
         settings = self._settings(probe_chat=True)
         options = {"trigger": trigger, "probe_chat": True, "limit": 2}
