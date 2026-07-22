@@ -1,0 +1,8 @@
+{
+  "name": "grok-reg-sentinel-vm",
+  "private": true,
+  "description": "Node deps for sentinel VM (turnstile proof generation)",
+  "dependencies": {
+    "jsdom": "^24.0.0"
+  }
+}

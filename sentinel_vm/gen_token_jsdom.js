@@ -7,8 +7,8 @@ const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 
-// 读取 SDK
-let sdkCode = fs.readFileSync(path.join(os.homedir(), ".codeium", "windsurf", "sentinel_sdk_full.js"), "utf-8");
+// 读取 SDK（随项目分发：sentinel_vm/sentinel_sdk_full.js）
+let sdkCode = fs.readFileSync(path.join(__dirname, "sentinel_sdk_full.js"), "utf-8");
 sdkCode = sdkCode.replace(/^"var SentinelSDK/, "var SentinelSDK");
 sdkCode = sdkCode.replace(/\\n"$/, "");
 sdkCode = sdkCode.replace(/\\"/g, '"');
