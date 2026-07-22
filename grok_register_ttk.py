@@ -1222,27 +1222,43 @@ def _build_request_kwargs(**kwargs):
 
 
 def http_get(url, **kwargs):
+    request_kwargs = _build_request_kwargs(**kwargs)
+    trust_env = request_kwargs.pop("trust_env", None)
     try:
-        return requests.get(url, **_build_request_kwargs(**kwargs))
+        if trust_env is not None:
+            with requests.Session(trust_env=trust_env) as session:
+                return session.get(url, **request_kwargs)
+        return requests.get(url, **request_kwargs)
     except Exception as exc:
         err = str(exc)
         # 代理不可用时自动回退为直连，避免整个流程直接失败
         if "127.0.0.1 port 7890" in err or "Could not connect to server" in err:
-            retry_kwargs = dict(kwargs)
+            retry_kwargs = dict(request_kwargs)
             retry_kwargs["proxies"] = {}
-            return requests.get(url, **_build_request_kwargs(**retry_kwargs))
+            retry_kwargs = _build_request_kwargs(**retry_kwargs)
+            retry_trust_env = retry_kwargs.pop("trust_env", False)
+            with requests.Session(trust_env=retry_trust_env) as session:
+                return session.get(url, **retry_kwargs)
         raise
 
 
 def http_post(url, **kwargs):
+    request_kwargs = _build_request_kwargs(**kwargs)
+    trust_env = request_kwargs.pop("trust_env", None)
     try:
-        return requests.post(url, **_build_request_kwargs(**kwargs))
+        if trust_env is not None:
+            with requests.Session(trust_env=trust_env) as session:
+                return session.post(url, **request_kwargs)
+        return requests.post(url, **request_kwargs)
     except Exception as exc:
         err = str(exc)
         if "127.0.0.1 port 7890" in err or "Could not connect to server" in err:
-            retry_kwargs = dict(kwargs)
+            retry_kwargs = dict(request_kwargs)
             retry_kwargs["proxies"] = {}
-            return requests.post(url, **_build_request_kwargs(**retry_kwargs))
+            retry_kwargs = _build_request_kwargs(**retry_kwargs)
+            retry_trust_env = retry_kwargs.pop("trust_env", False)
+            with requests.Session(trust_env=retry_trust_env) as session:
+                return session.post(url, **retry_kwargs)
         raise
 
 

@@ -206,6 +206,35 @@ class HotmailOAuthRefreshRetryTests(unittest.TestCase):
         self.assertEqual(calls[0][1].get("proxies"), {})
         self.assertIs(calls[0][1].get("trust_env"), False)
 
+
+    def test_http_post_puts_trust_env_on_session_not_request(self):
+        calls = []
+
+        class FakeSession:
+            def __init__(self, **kwargs):
+                calls.append(("init", kwargs))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def post(self, url, **kwargs):
+                calls.append(("post", kwargs))
+                class Response:
+                    status_code = 200
+                    text = "{}"
+                return Response()
+
+        with mock.patch.object(reg.requests, "Session", FakeSession):
+            resp = reg.http_post("https://example.test/token", data={"a": "b"}, proxies={}, trust_env=False)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(calls[0], ("init", {"trust_env": False}))
+        self.assertNotIn("trust_env", calls[1][1])
+        self.assertEqual(calls[1][1].get("proxies"), {})
+
     def test_refresh_retries_transient_tls_errors_before_succeeding(self):
         attempts = []
 
