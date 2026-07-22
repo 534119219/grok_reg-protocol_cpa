@@ -88,12 +88,15 @@ def create_agent_identity(
     *,
     email: str = "",
     proxy: str | None = None,
-    verify_task: bool = False,
+    verify_task: bool = True,
     impersonate: str = "chrome",
     out_dir: Path | None = None,
     log: LogFn | None = None,
 ) -> dict[str, Any]:
-    """注册 Codex agent 身份，返回 auth.json dict（并落盘 gpt_agents/agent-<email>.json）。"""
+    """注册 Codex agent 身份，返回 auth.json dict（并落盘 gpt_agents/agent-<email>.json）。
+
+    verify_task=True 时同时做 task 注册（sub2api 可用性需要 task_id）。
+    """
     from curl_cffi import requests as creq
 
     log = log or _noop
@@ -133,6 +136,7 @@ def create_agent_identity(
         raise RuntimeError(f"agent register 未返回 agent_runtime_id: {r.text[:200]}")
     log(f"[*] agent 已注册: {agent_runtime_id}")
 
+    task_id = ""
     if verify_task:
         try:
             from cryptography.hazmat.primitives.serialization import load_pem_private_key
@@ -157,12 +161,16 @@ def create_agent_identity(
                 json={"timestamp": timestamp, "signature": signature_b64},
                 **kwargs,
             )
-            log(f"[*] task 验证: HTTP {rt.status_code}")
+            if rt.status_code == 200:
+                task_id = str(rt.json().get("encrypted_task_id") or rt.json().get("task_id") or "")
+                log(f"[*] task 已注册: {task_id[:40]}")
+            else:
+                log(f"[Debug] task 注册 HTTP {rt.status_code}（不影响 auth.json）")
         except Exception as exc:
-            log(f"[Debug] task 验证失败（不影响 auth.json）: {exc}")
+            log(f"[Debug] task 注册失败（不影响 auth.json）: {exc}")
 
     auth_json = {
-        "auth_mode": "agent_identity",
+        "auth_mode": "agentIdentity",
         "agent_identity": {
             "agent_runtime_id": agent_runtime_id,
             "agent_private_key": private_key_b64,
@@ -173,6 +181,8 @@ def create_agent_identity(
             "chatgpt_account_is_fedramp": False,
         },
     }
+    if task_id:
+        auth_json["agent_identity"]["task_id"] = task_id
 
     root = out_dir or (Path(__file__).resolve().parent / GPT_AGENTS_DIR)
     root.mkdir(parents=True, exist_ok=True)
@@ -243,9 +253,12 @@ def push_to_sub2api(
         if not auth_json:
             raise RuntimeError("sub2api_format=agent 需要 auth_json（Agent Identity）")
         identity = dict(auth_json.get("agent_identity") or {})
-        # sub2api 期望平铺结构（与其手动导入一致），不是嵌套 agent_identity 对象
+        # sub2api 期望平铺结构（与其手动导入一致），不是嵌套 agent_identity 对象。
+        # 注意：task_id 不随推送写入——sub2api 导入流程会自己注册任务生成 task-XXX
+        # （OpenAI task/register 返回的 encrypted_task_id 与此不同，误传会报
+        #  "Unknown task for AgentAssertion"）。
         credentials = {
-            "auth_mode": "agent_identity",
+            "auth_mode": "agentIdentity",
             "agent_runtime_id": identity.get("agent_runtime_id", ""),
             "agent_private_key": identity.get("agent_private_key", ""),
             "chatgpt_account_id": identity.get("account_id", ""),
