@@ -243,10 +243,16 @@ def push_to_sub2api(
         if not auth_json:
             raise RuntimeError("sub2api_format=agent 需要 auth_json（Agent Identity）")
         identity = dict(auth_json.get("agent_identity") or {})
-        identity["email"] = email
+        # sub2api 期望平铺结构（与其手动导入一致），不是嵌套 agent_identity 对象
         credentials = {
             "auth_mode": "agent_identity",
-            "agent_identity": identity,
+            "agent_runtime_id": identity.get("agent_runtime_id", ""),
+            "agent_private_key": identity.get("agent_private_key", ""),
+            "chatgpt_account_id": identity.get("account_id", ""),
+            "chatgpt_user_id": identity.get("chatgpt_user_id", ""),
+            "email": email,
+            "plan_type": identity.get("plan_type", "free"),
+            "chatgpt_account_is_fedramp": bool(identity.get("chatgpt_account_is_fedramp", False)),
         }
     else:
         account = sess_data.get("account") or {}
