@@ -1512,6 +1512,7 @@ const GPT_EXTRA_FIELDS = [
   ["sub2api_base", "sub2api 地址", "text"],
   ["sub2api_api_key", "sub2api 管理密钥 (x-api-key)", "password"],
   ["sub2api_group_id", "sub2api 分组（id 或名称）", "text"],
+  ["sub2api_format", "推送格式 agent/oauth", "text"],
   ["sub2api_concurrency", "sub2api 账号并发", "number"],
   ["sub2api_priority", "sub2api 账号优先级", "number"],
 ];
@@ -1535,7 +1536,7 @@ const PAGE_SETTINGS = {
       ["浏览器与代理", ["register_headless", "register_threads", "thread_start_interval", "proxy", "browser_timezone", "user_agent"]],
       ["Solver 预留", ["turnstile_solver_provider", "protocol_solver_url", "protocol_solver_pass_proxy", "protocol_solver_locale", "protocol_solver_accept_language", "protocol_solver_timezone"]],
       ["Agent 身份", ["gpt_agent_enabled"]],
-      ["sub2api 推送", ["sub2api_enabled", "sub2api_base", "sub2api_api_key", "sub2api_group_id", "sub2api_concurrency", "sub2api_priority"]],
+      ["sub2api 推送", ["sub2api_enabled", "sub2api_base", "sub2api_api_key", "sub2api_group_id", "sub2api_format", "sub2api_concurrency", "sub2api_priority"]],
     ],
   },
   mail: {
