@@ -83,6 +83,8 @@ const state = {
     cache: {},
     fromCache: false,
   },
+  gptFlow: null,
+  _gptHeadlessSeeded: false,
   jobs: [],
   activeJobId: null,
   activeJobStarted: "",
@@ -172,6 +174,7 @@ function cpaScanOutcomePill(outcome) {
 
 const kindText = {
   register: "批量注册",
+  gpt_register: "GPT 注册工作流",
   backfill: "CPA 补 mint",
 };
 
@@ -196,6 +199,22 @@ const POLICY_ACTION_OPTIONS = [
   ["quarantine", "quarantine — 移入隔离区（推荐）"],
   ["delete", "delete — 移入 deleted 隔离区"],
 ];
+
+const GPT_FLOW_FALLBACK = {
+  source: "注册GPT.har",
+  entry_count: 638,
+  core_endpoint_count: 14,
+  steps: [
+    ["entry", "入口预检", "GET/POST", "chatgpt.com/backend-anon/*", "accounts/check, me, sentinel prepare", "accounts / prepare_token", "建立匿名会话与 Sentinel 要求"],
+    ["csrf", "NextAuth 发起", "GET/POST", "chatgpt.com/api/auth/{providers,csrf,signin/openai}", "callbackUrl, csrfToken, screen_hint, login_hint", "authorize url / state cookie", "原站发起 OpenAI Auth 授权"],
+    ["auth", "OpenAI Auth", "GET", "auth.openai.com/api/accounts/authorize → /email-verification", "client_id, scope, redirect_uri, state", "login_session / oai-client-auth-session", "进入邮箱验证码页面"],
+    ["otp", "邮箱 OTP", "POST", "auth.openai.com/api/accounts/email-otp/validate", "code", "continue_url=/about-you", "验证码成功后进入资料页"],
+    ["sentinel", "Sentinel 令牌", "POST", "sentinel.openai.com/backend-api/sentinel/req", "p, id, flow", "token / so / proofofwork", "create_account 前置令牌"],
+    ["profile", "创建资料", "POST", "auth.openai.com/api/accounts/create_account", "name, birthdate", "continue_url=callback", "提交资料并生成回调 URL"],
+    ["callback", "回调换会话", "GET", "chatgpt.com/api/auth/callback/openai", "code, scope, state", "next-auth session-token", "落盘 ChatGPT 登录态"],
+    ["probe", "登录态验证", "GET/POST", "chatgpt.com/backend-api/{me,accounts/check,models}", "OAI-* headers, Authorization", "me / accounts / models", "判断账号可进入主界面"],
+  ].map(([key, name, method, endpoint, request, response, note]) => ({ key, name, method, endpoint, request, response, note })),
+};
 
 const CONFIG_FIELDS = {
   basic: [
@@ -458,6 +477,7 @@ function setView(view, toolPage = null) {
   if (view === "cpa") loadCpa().catch((e) => toast(e.message, true));
   if (view === "mail") loadMail().catch((e) => toast(e.message, true));
   if (view === "proxies") loadProxies().catch((e) => toast(e.message, true));
+  if (view === "gpt") loadGptFlow().catch((e) => toast(e.message, true));
   if (view === "settings") loadConfig().catch((e) => toast(e.message, true));
   if (view === "tools") setToolPage(state.toolPage, false);
 }
@@ -515,6 +535,7 @@ function renderOverview() {
 
   renderPipeline(o);
   renderActiveJob(o.active_job);
+  renderGptOverview(o);
 }
 
 async function loadOverview() {
@@ -586,6 +607,7 @@ function renderActiveJob(job) {
     detailEl.hidden = true;
     stopBtn.disabled = true;
     navActive.hidden = true;
+    renderGptJob(null);
     return;
   }
 
@@ -614,6 +636,14 @@ function renderActiveJob(job) {
       statCell("Mint 成功", s.mint_success ?? 0, "accent") +
       statCell("Mint 失败", s.mint_fail ?? 0, (s.mint_fail ?? 0) > 0 ? "err" : "") +
       statCell("进度", `${s.done ?? 0}/${s.target ?? 0}`);
+  } else if (job.kind === "gpt_register") {
+    $("#active-job-stats").innerHTML =
+      statCell("目标", s.target ?? 0) +
+      statCell("阶段", `${s.stage_index ?? 0}/${s.steps ?? 0}`, "accent") +
+      statCell("会话", s.session_ready ?? 0, (s.session_ready ?? 0) > 0 ? "ok" : "") +
+      statCell("Probe", s.probed ?? 0, (s.probed ?? 0) > 0 ? "ok" : "") +
+      statCell("完成步", `${s.done ?? 0}/${s.total ?? 0}`) +
+      statCell("模式", job.options?.plan_only ? "预检" : "执行");
   } else {
     $("#active-job-stats").innerHTML =
       statCell("成功", s.ok ?? 0, "ok") +
@@ -624,6 +654,118 @@ function renderActiveJob(job) {
   const pct = jobProgress(job);
   $("#active-job-progress").style.width = `${pct}%`;
   $("#active-job-progress-text").textContent = `${Math.round(pct)}%`;
+  renderGptJob(job);
+}
+
+/* ── GPT workbench ── */
+
+function gptFlow() {
+  return state.gptFlow || GPT_FLOW_FALLBACK;
+}
+
+async function loadGptFlow() {
+  try {
+    state.gptFlow = await api("/api/gpt/register/flow");
+  } catch (err) {
+    state.gptFlow = GPT_FLOW_FALLBACK;
+    throw err;
+  } finally {
+    renderGptFlow();
+    renderGptOverview(state.overview || {});
+  }
+}
+
+function renderGptFlow() {
+  const flow = gptFlow();
+  const rows = flow.steps || [];
+  const tbody = $("#gpt-flow-rows");
+  if (!tbody) return;
+  tbody.innerHTML = "";
+  for (const step of rows) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><span class="pill info">${esc(step.name || step.key || "-")}</span></td>
+      <td><span class="gpt-endpoint" title="${esc(step.endpoint || "")}">${esc(step.method || "-")} ${esc(step.endpoint || "-")}</span></td>
+      <td><small class="table-sub">${esc(step.request || "-")}</small></td>
+      <td><small class="table-sub">${esc(step.response || "-")}</small></td>
+      <td><small class="table-sub">${esc(step.note || "-")}</small></td>
+    `;
+    tbody.append(tr);
+  }
+  $("#gpt-m-har-entries").textContent = flow.entry_count ?? 0;
+  $("#gpt-m-core-endpoints").textContent = flow.core_endpoint_count ?? rows.length;
+  $("#gpt-m-har-source").textContent = flow.source || "注册GPT.har";
+}
+
+function renderGptOverview(o = {}) {
+  if (!$("#gpt-m-mail")) return;
+  const proxyTotal = state.proxies.length || Number(o.proxy_total || 0);
+  $("#gpt-m-mail").textContent = o.mail_total ?? 0;
+  $("#gpt-m-provider").textContent = o.email_provider || "-";
+  $("#gpt-m-proxies").textContent = proxyTotal;
+  $("#gpt-meta-provider").textContent = o.email_provider || "-";
+  $("#gpt-meta-proxy").textContent = o.proxy || "-";
+  $("#gpt-meta-browser").textContent = $("#gpt-headless")?.checked ? "headless" : "headed";
+  if (typeof o.register_headless === "boolean" && !state._gptHeadlessSeeded) {
+    $("#gpt-headless").checked = o.register_headless;
+    $("#gpt-meta-browser").textContent = o.register_headless ? "headless" : "headed";
+    state._gptHeadlessSeeded = true;
+  }
+  renderGptPipeline(o.active_job || null);
+  renderGptJob(o.active_job || null);
+}
+
+function renderGptPipeline(job) {
+  const steps = (gptFlow().steps || []).map((s) => String(s.key || ""));
+  const isGpt = job && job.kind === "gpt_register";
+  const running = isGpt && (job.status === "running" || job.status === "queued");
+  const completed = isGpt && job.status === "completed";
+  const stage = isGpt ? Number(job.stats?.stage_index || 0) : 0;
+  $$("#gpt-pipeline [data-gpt-step]").forEach((el, idx) => {
+    const key = el.dataset.gptStep;
+    const pos = Math.max(1, steps.indexOf(key) + 1 || idx + 1);
+    el.classList.toggle("active", running && pos === Math.max(1, stage));
+    el.classList.toggle("done", completed || (isGpt && pos < stage));
+  });
+}
+
+function renderGptJob(job) {
+  if (!$("#gpt-active-job-status")) return;
+  const statusEl = $("#gpt-active-job-status");
+  const stopBtn = $("#gpt-stop-active-job");
+  const idleEl = $("#gpt-active-job-idle");
+  const detailEl = $("#gpt-active-job-detail");
+  const isGpt = job && job.kind === "gpt_register";
+  if (!isGpt) {
+    statusEl.className = "pill idle";
+    statusEl.textContent = job ? `其他任务：${kindText[job.kind] || job.kind}` : "空闲";
+    idleEl.hidden = false;
+    detailEl.hidden = true;
+    stopBtn.disabled = !(job && (job.status === "running" || job.status === "queued"));
+    renderGptPipeline(null);
+    return;
+  }
+  const running = job.status === "running" || job.status === "queued";
+  const s = job.stats || {};
+  statusEl.className = `pill ${job.status}`;
+  statusEl.textContent = statusText[job.status] || job.status;
+  stopBtn.disabled = !running;
+  idleEl.hidden = true;
+  detailEl.hidden = false;
+  $("#gpt-active-job-id").textContent = job.id || "-";
+  $("#gpt-active-job-kind").textContent = kindText[job.kind] || job.kind;
+  $("#gpt-active-job-elapsed").textContent = fmtElapsed(job.started_at || state.activeJobStarted);
+  $("#gpt-active-job-stats").innerHTML =
+    statCell("目标", s.target ?? 0) +
+    statCell("阶段", `${s.stage_index ?? 0}/${s.steps ?? 0}`, "accent") +
+    statCell("OTP", s.otp_ready ?? 0, (s.otp_ready ?? 0) > 0 ? "ok" : "") +
+    statCell("Sentinel", s.sentinel_ready ?? 0, (s.sentinel_ready ?? 0) > 0 ? "ok" : "") +
+    statCell("Session", s.session_ready ?? 0, (s.session_ready ?? 0) > 0 ? "ok" : "") +
+    statCell("进度", `${s.done ?? 0}/${s.total ?? 0}`);
+  const pct = jobProgress(job);
+  $("#gpt-active-job-progress").style.width = `${pct}%`;
+  $("#gpt-active-job-progress-text").textContent = `${Math.round(pct)}%`;
+  renderGptPipeline(job);
 }
 
 /* ── live log ── */
@@ -633,39 +775,47 @@ function classifyLog(line) {
   if (/注册成功|CPA auth|ok ->|moved ->|完成:|\+ /.test(line)) return "ok";
   if (/背压|重试|跳过|skipped|等待|retry/i.test(line)) return "warn";
   if (/===/.test(line)) return "hl";
+  if (/gpt|openai|nextauth|sentinel|otp|callback/i.test(line)) return "cpa";
   if (/cpa|mint|pkce|oidc|hotload/i.test(line)) return "cpa";
   return "";
 }
 
 function appendLogs(lines) {
   if (!lines || !lines.length) return;
-  const panel = $("#live-log");
-  const placeholder = panel.querySelector(".log-line.dim");
-  if (placeholder && placeholder.textContent.startsWith("//")) placeholder.remove();
-  const frag = document.createDocumentFragment();
-  for (const line of lines) {
-    state.logCount += 1;
-    const div = document.createElement("div");
-    div.className = `log-line ${classifyLog(line)}`.trim();
-    const m = String(line).match(/^\[(\d{2}:\d{2}:\d{2})\]\s?(.*)$/s);
-    if (m) {
-      div.innerHTML = `<span class="ts">[${esc(m[1])}]</span> ${esc(m[2])}`;
-    } else {
-      div.textContent = line;
+  const panels = [
+    { panel: $("#live-log"), autoscroll: $("#log-autoscroll") },
+    { panel: $("#gpt-live-log"), autoscroll: $("#gpt-log-autoscroll") },
+  ].filter((x) => x.panel);
+  for (const { panel, autoscroll } of panels) {
+    const placeholder = panel.querySelector(".log-line.dim");
+    if (placeholder && placeholder.textContent.startsWith("//")) placeholder.remove();
+    const frag = document.createDocumentFragment();
+    for (const line of lines) {
+      const div = document.createElement("div");
+      div.className = `log-line ${classifyLog(line)}`.trim();
+      const m = String(line).match(/^\[(\d{2}:\d{2}:\d{2})\]\s?(.*)$/s);
+      if (m) {
+        div.innerHTML = `<span class="ts">[${esc(m[1])}]</span> ${esc(m[2])}`;
+      } else {
+        div.textContent = line;
+      }
+      frag.append(div);
     }
-    frag.append(div);
+    panel.append(frag);
+    while (panel.children.length > 2000 && panel.firstChild) {
+      panel.removeChild(panel.firstChild);
+    }
+    if (!autoscroll || autoscroll.checked) panel.scrollTop = panel.scrollHeight;
   }
-  panel.append(frag);
-  while (state.logCount > 2000 && panel.firstChild) {
-    panel.removeChild(panel.firstChild);
-    state.logCount -= 1;
-  }
-  if ($("#log-autoscroll").checked) panel.scrollTop = panel.scrollHeight;
+  state.logCount = ($("#live-log")?.children.length || 0);
 }
 
 function resetLogs(msg = "// 等待任务启动，日志将实时输出在这里") {
   state.logCount = 1;
   $("#live-log").innerHTML = `<div class="log-line dim">${esc(msg)}</div>`;
+  if ($("#gpt-live-log")) {
+    $("#gpt-live-log").innerHTML = `<div class="log-line dim">${esc(msg)}</div>`;
+  }
 }
 
 /* ── accounts ── */
@@ -1191,13 +1341,14 @@ async function loadProxies() {
 }
 
 function renderProxyFixedOptions() {
-  const sel = $("#reg-proxy-fixed");
-  if (!sel) return;
-  const prev = sel.value;
-  sel.innerHTML = state.proxies.length
-    ? state.proxies.map((p) => `<option value="${esc(p.raw)}">${esc(p.masked)}</option>`).join("")
-    : `<option value="">（代理池为空，请先导入）</option>`;
-  if (prev && state.proxies.some((p) => p.raw === prev)) sel.value = prev;
+  for (const sel of ["#reg-proxy-fixed", "#gpt-proxy-fixed"].map((s) => $(s)).filter(Boolean)) {
+    const prev = sel.value;
+    sel.innerHTML = state.proxies.length
+      ? state.proxies.map((p) => `<option value="${esc(p.raw)}">${esc(p.masked)}</option>`).join("")
+      : `<option value="">（代理池为空，请先导入）</option>`;
+    if (prev && state.proxies.some((p) => p.raw === prev)) sel.value = prev;
+  }
+  renderGptOverview(state.overview || {});
 }
 
 async function checkProxies(keys = []) {
@@ -1355,7 +1506,26 @@ const EXTRA_FIELDS = [
 ];
 EXTRA_FIELDS.forEach(([k, l, t]) => { if (!FIELD_MAP[k]) FIELD_MAP[k] = [k, l, t]; });
 
+const GPT_EXTRA_FIELDS = [
+  ["gpt_agent_enabled", "注册后生成 Codex agent 身份", "bool"],
+  ["sub2api_enabled", "注册后推送 sub2api", "bool"],
+  ["sub2api_base", "sub2api 地址", "text"],
+  ["sub2api_api_key", "sub2api 管理密钥 (x-api-key)", "password"],
+  ["sub2api_group_id", "sub2api 分组（id 或名称）", "text"],
+  ["sub2api_concurrency", "sub2api 账号并发", "number"],
+  ["sub2api_priority", "sub2api 账号优先级", "number"],
+];
+GPT_EXTRA_FIELDS.forEach(([k, l, t]) => { if (!FIELD_MAP[k]) FIELD_MAP[k] = [k, l, t]; });
+
 const PAGE_SETTINGS = {
+  gpt: {
+    title: "GPT 注册配置",
+    eyebrow: "GPT CONFIG",
+    groups: [
+      ["Agent 身份", ["gpt_agent_enabled"]],
+      ["sub2api 推送", ["sub2api_enabled", "sub2api_base", "sub2api_api_key", "sub2api_group_id", "sub2api_concurrency", "sub2api_priority"]],
+    ],
+  },
   console: {
     title: "注册流程配置",
     eyebrow: "CONSOLE CONFIG",
@@ -1363,6 +1533,15 @@ const PAGE_SETTINGS = {
       ["注册行为", ["register_headless", "register_threads", "thread_start_interval", "register_max_attempts", "account_hard_timeout", "mail_timeout", "mail_poll_interval", "mail_retry_count", "enable_nsfw", "user_agent"]],
       ["纯协议注册 / Turnstile Solver", ["protocol_register", "protocol_only", "protocol_register_fallback_browser", "turnstile_solver_provider", "protocol_solver_url", "protocol_solver_pass_proxy", "protocol_solver_locale", "protocol_solver_accept_language", "protocol_solver_timezone", "protocol_impersonate", "protocol_register_max_attempts", "protocol_solver_poll_timeout", "protocol_solver_poll_interval", "turnstile_site_key", "yescaptcha_key", "twocaptcha_enabled", "twocaptcha_key", "twocaptcha_pass_proxy", "twocaptcha_timeout", "twocaptcha_poll_interval", "twocaptcha_api_base", "protocol_email_tempmail_fallback"]],
       ["grok2api 推送", ["grok2api_auto_add_local", "grok2api_local_token_file", "grok2api_auto_add_remote", "grok2api_remote_base", "grok2api_remote_app_key", "grok2api_pool_name"]],
+    ],
+  },
+  gpt: {
+    title: "GPT 注册工作台配置",
+    eyebrow: "GPT CONFIG",
+    groups: [
+      ["邮箱与收码", ["email_provider", "hotmail_accounts_file", "hotmail_protocol", "mail_timeout", "mail_poll_interval", "mail_retry_count"]],
+      ["浏览器与代理", ["register_headless", "register_threads", "thread_start_interval", "proxy", "browser_timezone", "user_agent"]],
+      ["Solver 预留", ["turnstile_solver_provider", "protocol_solver_url", "protocol_solver_pass_proxy", "protocol_solver_locale", "protocol_solver_accept_language", "protocol_solver_timezone"]],
     ],
   },
   mail: {
@@ -2163,6 +2342,8 @@ function renderJobs() {
       <div class="job-counts">
         ${job.kind === "register"
           ? `<span>成功 ${s.reg_success || 0}</span><span>失败 ${s.reg_fail || 0}</span><span>mint ${s.mint_success || 0}</span>`
+          : job.kind === "gpt_register"
+            ? `<span>target ${s.target || 0}</span><span>stage ${s.stage_index || 0}/${s.steps || 0}</span><span>${s.done || 0}/${s.total || 0}</span>`
           : `<span>ok ${s.ok || 0}</span><span>fail ${s.fail || 0}</span><span>${s.done || 0}/${s.total || 0}</span>`}
       </div>
       <div class="progress"><div class="progress-bar" style="width:${pct}%"></div></div>
@@ -2187,6 +2368,7 @@ async function loadJobs() {
 
 async function pollActiveJob() {
   try {
+    const previousActiveId = state.activeJobId;
     state.overview = await api("/api/overview");
     renderOverview();
     if (state.view === "cpa") {
@@ -2199,14 +2381,16 @@ async function pollActiveJob() {
         renderCpa();
       }
     }
-    if (!state.activeJobId) return;
-    const detail = await api(`/api/jobs/${state.activeJobId}?after=${state.logCursor}`);
+    const detailJobId = state.activeJobId || previousActiveId;
+    if (!detailJobId) return;
+    const detail = await api(`/api/jobs/${detailJobId}?after=${state.logCursor}`);
     renderActiveJob(detail);
     if (detail.logs && detail.logs.length) appendLogs(detail.logs);
     state.logCursor = detail.log_seq || state.logCursor;
     if (["completed", "failed", "stopped"].includes(detail.status)) {
       if (state.view === "accounts") loadAccounts().catch(() => {});
       if (state.view === "cpa") loadCpa().catch(() => {});
+      state.activeJobId = null;
     }
   } catch (err) {
     $("#side-status-text").textContent = "连接异常，重试中…";
@@ -2238,14 +2422,54 @@ async function startRegister() {
     toast("代理池为空，请先在代理池页面导入", true);
     return;
   }
+  const target = $("#reg-target") ? $("#reg-target").value : "grok";
   try {
-    const job = await api("/api/jobs/register", { method: "POST", body: JSON.stringify(body) });
+    const url = target === "gpt" ? "/api/jobs/gpt-register" : "/api/jobs/register";
+    const job = await api(url, { method: "POST", body: JSON.stringify(body) });
     state.activeJobId = job.id;
     state.logCursor = 0;
     resetLogs("// 任务已创建，正在初始化…");
     appendLogs([`任务已创建: ${job.id}`]);
     renderActiveJob(job);
     toast("注册任务已启动");
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+async function startGptRegister() {
+  const proxyMode = $("#gpt-proxy-mode").value;
+  const body = {
+    extra: Number($("#gpt-extra").value || 1),
+    threads: Number($("#gpt-threads").value || 1),
+    otp_timeout: Number($("#gpt-otp-timeout").value || 300),
+    auth_entry: $("#gpt-auth-entry").value,
+    headless: $("#gpt-headless").checked,
+    fast: $("#gpt-fast").checked,
+    auto_continue: $("#gpt-auto-continue").checked,
+    probe: $("#gpt-probe").checked,
+    proxy_mode: proxyMode,
+    proxy_fixed: proxyMode === "fixed" ? $("#gpt-proxy-fixed").value : "",
+    source: "gpt_workbench",
+  };
+  if (proxyMode === "fixed" && !body.proxy_fixed) {
+    toast("请选择固定代理（或先在代理池导入）", true);
+    return;
+  }
+  if (proxyMode === "random" && !state.proxies.length) {
+    toast("代理池为空，请先在代理池页面导入", true);
+    return;
+  }
+  try {
+    const job = await api("/api/jobs/gpt-register", { method: "POST", body: JSON.stringify(body) });
+    state.activeJobId = job.id;
+    state.activeJobStarted = job.started_at || "";
+    state.logCursor = 0;
+    resetLogs("// GPT 工作流任务已创建，正在输出 HAR 流程预检…");
+    appendLogs([`GPT 工作流任务已创建: ${job.id}`]);
+    renderActiveJob(job);
+    renderGptJob(job);
+    toast("GPT 工作流任务已启动");
   } catch (err) {
     toast(err.message, true);
   }
@@ -2428,6 +2652,22 @@ function bindEvents() {
   });
   $("#stop-active-job").addEventListener("click", () => stopJob(state.activeJobId));
   $("#clear-log").addEventListener("click", () => resetLogs());
+
+  /* GPT workbench */
+  $("#gpt-refresh-flow").addEventListener("click", () =>
+    loadGptFlow().then(() => toast("GPT 流程已刷新")).catch((e) => toast(`流程刷新失败，已使用内置摘要: ${e.message}`, true)));
+  $("#start-gpt-register").addEventListener("click", startGptRegister);
+  $("#gpt-stop-active-job").addEventListener("click", () => stopJob(state.activeJobId));
+  $("#gpt-clear-log").addEventListener("click", () => resetLogs("// 等待 GPT 工作流启动，日志将同步显示在这里"));
+  $("#gpt-headless").addEventListener("change", () => {
+    $("#gpt-meta-browser").textContent = $("#gpt-headless").checked ? "headless" : "headed";
+  });
+  $("#gpt-proxy-mode").addEventListener("change", (e) => {
+    $("#gpt-proxy-fixed-wrap").hidden = e.target.value !== "fixed";
+    if (e.target.value === "fixed" && !state.proxies.length) {
+      loadProxies().catch(() => {});
+    }
+  });
 
   /* accounts */
   $("#refresh-accounts").addEventListener("click", () => loadAccounts().catch((e) => toast(e.message, true)));

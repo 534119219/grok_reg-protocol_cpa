@@ -783,6 +783,7 @@ class JobRunner:
                             headless=headless,
                             otp_timeout=otp_timeout,
                             probe=bool(job.options.get("probe", True)),
+                            config=cfg,
                             log=log,
                             cancel=cancel,
                             on_stage=on_stage,

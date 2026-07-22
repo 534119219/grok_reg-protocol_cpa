@@ -312,13 +312,20 @@ def run_gpt_register(
     impersonate: str = "firefox144",
     name: str = "",
     birthdate: str = "",
+    config: dict[str, Any] | None = None,
     log: LogFn | None = None,
     cancel: Callable[[], bool] | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """执行一次纯协议 GPT 注册。成功返回 {ok, email, access_token}。"""
+    """执行一次纯协议 GPT 注册。成功返回 {ok, email, access_token}。
+
+    注册成功后按 config 追加产物：
+      - gpt_agent_enabled（默认 True）: 注册 Codex agent 身份 → gpt_agents/agent-<email>.json
+      - sub2api_enabled: 推送账号到 sub2api（x-api-key + 指定分组）
+    """
     log = log or _noop
     stage_cb = on_stage or (lambda _s: None)
+    cfg = config or {}
     gen_name, gen_bd, password = _gen_profile()
     name = name or gen_name
     birthdate = birthdate or gen_bd
@@ -352,6 +359,35 @@ def run_gpt_register(
     )
     if result.get("ok"):
         _save_account(email, password, result.get("access_token", ""), result.get("session_data") or {}, log)
+
+        access_token = result.get("access_token", "")
+        # Agent 身份（默认开启）
+        if access_token and cfg.get("gpt_agent_enabled", True):
+            try:
+                import gpt_agent
+
+                gpt_agent.create_agent_identity(
+                    access_token, email=email, proxy=proxy, log=log
+                )
+            except Exception as exc:
+                log(f"[!] agent 身份注册失败（不影响注册）: {exc}")
+
+        # sub2api 推送（配置开启时）
+        if access_token and cfg.get("sub2api_enabled"):
+            try:
+                import gpt_agent
+
+                gpt_agent.push_to_sub2api(
+                    sess_data=result.get("session_data") or {},
+                    email=email,
+                    access_token=access_token,
+                    cfg=cfg,
+                    proxy=proxy,
+                    log=log,
+                )
+            except Exception as exc:
+                log(f"[!] sub2api 推送失败（不影响注册）: {exc}")
+
         log(f"+ GPT 注册成功: {email}")
     return result
 
