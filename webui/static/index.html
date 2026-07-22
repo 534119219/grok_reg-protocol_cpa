@@ -56,6 +56,9 @@
         <button class="nav-item active" data-view="console" type="button">
           <svg><use href="#i-console"/></svg><span>注册控制台</span>
         </button>
+        <button class="nav-item" data-view="gpt" type="button">
+          <svg><use href="#i-zap"/></svg><span>GPT 注册</span>
+        </button>
         <button class="nav-item" data-view="accounts" type="button">
           <svg><use href="#i-users"/></svg><span>账号账本</span>
           <em class="nav-count" id="nav-accounts-count" hidden></em>
@@ -204,6 +207,13 @@
             <div class="panel-body">
               <div class="form-grid">
                 <label class="field">
+                  <span>注册目标 <em>Grok / GPT</em></span>
+                  <select id="reg-target" class="select wide">
+                    <option value="grok">Grok（xAI，产出 CPA）</option>
+                    <option value="gpt">GPT（ChatGPT / OpenAI）</option>
+                  </select>
+                </label>
+                <label class="field">
                   <span>新增数量 <em>extra</em></span>
                   <input id="reg-extra" type="number" min="1" max="1000" value="1">
                 </label>
@@ -275,6 +285,7 @@
                 <div class="job-meta-line">
                   <span class="chip mono" id="active-job-id">-</span>
                   <span class="chip" id="active-job-kind">-</span>
+                  <span class="chip" id="active-job-source" hidden></span>
                   <span class="chip" id="active-job-elapsed">00:00</span>
                 </div>
                 <div class="job-stats" id="active-job-stats"></div>
@@ -300,6 +311,247 @@
           </div>
           <div class="log-panel" id="live-log">
             <div class="log-line dim">// 等待任务启动，日志将实时输出在这里</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ── GPT register workbench ── -->
+      <section class="view" data-view-panel="gpt" hidden>
+        <header class="topbar">
+          <div class="topbar-title">
+            <p class="eyebrow">GPT REGISTER WORKBENCH</p>
+            <h1>GPT 注册工作台</h1>
+            <p class="topbar-sub">按 <code>注册GPT.har</code> 提取的 ChatGPT / OpenAI Auth 流程编排，复用原注册台的邮箱、代理、线程与任务日志能力</p>
+          </div>
+          <div class="top-actions">
+            <button class="btn ghost" data-page-settings="gpt" type="button" title="GPT 注册相关配置">
+              <svg><use href="#i-settings"/></svg>页面设置
+            </button>
+            <button class="btn ghost" id="gpt-refresh-flow" type="button">
+              <svg><use href="#i-refresh"/></svg>刷新流程
+            </button>
+            <button class="btn danger" id="gpt-stop-active-job" type="button" disabled>
+              <svg><use href="#i-stop"/></svg>停止任务
+            </button>
+            <button class="btn primary" id="start-gpt-register" type="button">
+              <svg><use href="#i-play"/></svg>启动 GPT 工作流
+            </button>
+          </div>
+        </header>
+
+        <div class="kpis gpt-kpis">
+          <div class="kpi">
+            <span class="kpi-label">HAR 请求</span>
+            <strong class="kpi-value" id="gpt-m-har-entries">0</strong>
+            <span class="kpi-sub" id="gpt-m-har-source">注册GPT.har</span>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">核心端点</span>
+            <strong class="kpi-value" id="gpt-m-core-endpoints">0</strong>
+            <span class="kpi-sub">去除静态与埋点</span>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">邮箱凭证</span>
+            <strong class="kpi-value ok" id="gpt-m-mail">0</strong>
+            <span class="kpi-sub" id="gpt-m-provider">-</span>
+          </div>
+          <div class="kpi warn">
+            <span class="kpi-label">代理池</span>
+            <strong class="kpi-value" id="gpt-m-proxies">0</strong>
+            <span class="kpi-sub">可按账号轮换</span>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">验证阶段</span>
+            <strong class="kpi-value accent">OTP</strong>
+            <span class="kpi-sub">email-otp + Sentinel</span>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">登录产物</span>
+            <strong class="kpi-value">Session</strong>
+            <span class="kpi-sub">next-auth session-token</span>
+          </div>
+        </div>
+
+        <div class="panel pipeline-panel">
+          <div class="pipeline gpt-pipeline" id="gpt-pipeline">
+            <div class="pstep" data-gpt-step="entry">
+              <span class="pstep-dot"><svg><use href="#i-console"/></svg></span>
+              <div class="pstep-text"><strong>入口预检</strong><small>backend-anon</small></div>
+              <span class="pstep-value">01</span>
+            </div>
+            <span class="pstep-link"></span>
+            <div class="pstep" data-gpt-step="csrf">
+              <span class="pstep-dot"><svg><use href="#i-key"/></svg></span>
+              <div class="pstep-text"><strong>NextAuth</strong><small>csrf/signin</small></div>
+              <span class="pstep-value">02</span>
+            </div>
+            <span class="pstep-link"></span>
+            <div class="pstep" data-gpt-step="auth">
+              <span class="pstep-dot"><svg><use href="#i-shield"/></svg></span>
+              <div class="pstep-text"><strong>OpenAI Auth</strong><small>authorize</small></div>
+              <span class="pstep-value">03</span>
+            </div>
+            <span class="pstep-link"></span>
+            <div class="pstep" data-gpt-step="otp">
+              <span class="pstep-dot"><svg><use href="#i-mail"/></svg></span>
+              <div class="pstep-text"><strong>邮箱 OTP</strong><small>validate</small></div>
+              <span class="pstep-value">04</span>
+            </div>
+            <span class="pstep-link"></span>
+            <div class="pstep" data-gpt-step="sentinel">
+              <span class="pstep-dot"><svg><use href="#i-zap"/></svg></span>
+              <div class="pstep-text"><strong>Sentinel</strong><small>token / so</small></div>
+              <span class="pstep-value">05</span>
+            </div>
+            <span class="pstep-link"></span>
+            <div class="pstep" data-gpt-step="profile">
+              <span class="pstep-dot"><svg><use href="#i-users"/></svg></span>
+              <div class="pstep-text"><strong>创建资料</strong><small>name / birthdate</small></div>
+              <span class="pstep-value">06</span>
+            </div>
+            <span class="pstep-link"></span>
+            <div class="pstep" data-gpt-step="callback">
+              <span class="pstep-dot"><svg><use href="#i-swap"/></svg></span>
+              <div class="pstep-text"><strong>回调会话</strong><small>callback/openai</small></div>
+              <span class="pstep-value">07</span>
+            </div>
+            <span class="pstep-link"></span>
+            <div class="pstep" data-gpt-step="probe">
+              <span class="pstep-dot"><svg><use href="#i-check"/></svg></span>
+              <div class="pstep-text"><strong>登录验证</strong><small>me/models</small></div>
+              <span class="pstep-value">08</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="gpt-grid">
+          <div class="panel">
+            <div class="panel-head">
+              <h2><svg><use href="#i-play"/></svg>启动参数</h2>
+              <span class="chip">mode: <b>HAR runbook</b></span>
+            </div>
+            <div class="panel-body">
+              <div class="form-grid">
+                <label class="field">
+                  <span>新增数量 <em>extra</em></span>
+                  <input id="gpt-extra" type="number" min="1" max="1000" value="1">
+                </label>
+                <label class="field">
+                  <span>注册线程 <em>1-100</em></span>
+                  <input id="gpt-threads" type="number" min="1" max="100" value="1">
+                </label>
+                <label class="field">
+                  <span>OTP 超时 <em>秒</em></span>
+                  <input id="gpt-otp-timeout" type="number" min="10" max="3600" value="300">
+                </label>
+                <label class="field">
+                  <span>认证入口 <em>HAR</em></span>
+                  <select id="gpt-auth-entry" class="select wide">
+                    <option value="chatgpt-nextauth">ChatGPT NextAuth → OpenAI Auth</option>
+                    <option value="auth-direct">OpenAI Auth 直连（预留）</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>代理模式 <em>任务级</em></span>
+                  <select id="gpt-proxy-mode" class="select wide">
+                    <option value="config">跟随配置（config.json）</option>
+                    <option value="fixed">固定代理（池中单选）</option>
+                    <option value="random">随机轮换（每账号随机）</option>
+                  </select>
+                </label>
+                <label class="field" id="gpt-proxy-fixed-wrap" hidden>
+                  <span>固定代理 <em>来自代理池</em></span>
+                  <select id="gpt-proxy-fixed" class="select wide"></select>
+                </label>
+                <div class="field toggles">
+                  <label class="switch-row">
+                    <span>无头浏览器</span>
+                    <span class="switch"><input id="gpt-headless" type="checkbox"><i></i></span>
+                  </label>
+                  <label class="switch-row">
+                    <span>快速模式</span>
+                    <span class="switch"><input id="gpt-fast" type="checkbox" checked><i></i></span>
+                  </label>
+                  <label class="switch-row">
+                    <span>OTP 后自动继续</span>
+                    <span class="switch"><input id="gpt-auto-continue" type="checkbox" checked><i></i></span>
+                  </label>
+                  <label class="switch-row">
+                    <span>登录后 probe</span>
+                    <span class="switch"><input id="gpt-probe" type="checkbox" checked><i></i></span>
+                  </label>
+                </div>
+              </div>
+              <p class="hint">本页面已接入 WebUI 任务/日志/代理选择框架；当前仓库尚无 ChatGPT 自动注册执行器，所以「启动」会跑 HAR 流程预检，不会写账号文件。接入执行器后可直接复用这些参数。</p>
+              <div class="meta-chips">
+                <span class="chip">邮箱服务商 <b id="gpt-meta-provider">-</b></span>
+                <span class="chip">全局代理 <b id="gpt-meta-proxy">-</b></span>
+                <span class="chip">浏览器 <b id="gpt-meta-browser">headed</b></span>
+                <span class="chip">产物 <b>session-token</b></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <h2><svg><use href="#i-zap"/></svg>GPT 当前任务</h2>
+              <span class="pill idle" id="gpt-active-job-status">空闲</span>
+            </div>
+            <div class="panel-body">
+              <div class="job-idle" id="gpt-active-job-idle">
+                <svg><use href="#i-box"/></svg>
+                <p>暂无 GPT 工作流任务</p>
+                <span>配置左侧参数后点击「启动 GPT 工作流」</span>
+              </div>
+              <div class="job-active" id="gpt-active-job-detail" hidden>
+                <div class="job-meta-line">
+                  <span class="chip mono" id="gpt-active-job-id">-</span>
+                  <span class="chip" id="gpt-active-job-kind">-</span>
+                  <span class="chip" id="gpt-active-job-elapsed">00:00</span>
+                </div>
+                <div class="job-stats" id="gpt-active-job-stats"></div>
+                <div class="progress">
+                  <div class="progress-bar" id="gpt-active-job-progress"></div>
+                </div>
+                <div class="progress-label"><span id="gpt-active-job-progress-text">0%</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2><svg><use href="#i-file"/></svg>HAR 核心流程</h2>
+            <span class="hint">已脱敏：仅保留 endpoint / 字段结构 / 响应含义</span>
+          </div>
+          <div class="table-wrap gpt-flow-wrap">
+            <table class="gpt-flow-table">
+              <thead>
+                <tr>
+                  <th>阶段</th>
+                  <th>请求</th>
+                  <th>关键字段</th>
+                  <th>成功依据</th>
+                  <th>备注</th>
+                </tr>
+              </thead>
+              <tbody id="gpt-flow-rows"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel log-wrap">
+          <div class="panel-head">
+            <h2><svg><use href="#i-console"/></svg>GPT 工作流日志</h2>
+            <div class="log-tools">
+              <label class="switch-row slim"><span>自动滚动</span>
+                <span class="switch"><input id="gpt-log-autoscroll" type="checkbox" checked><i></i></span>
+              </label>
+              <button class="btn ghost sm" id="gpt-clear-log" type="button">清空视图</button>
+            </div>
+          </div>
+          <div class="log-panel" id="gpt-live-log">
+            <div class="log-line dim">// 等待 GPT 工作流启动，日志将同步显示在这里</div>
           </div>
         </div>
       </section>

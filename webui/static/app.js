@@ -598,6 +598,16 @@ function renderActiveJob(job) {
   const detailEl = $("#active-job-detail");
   const navActive = $("#nav-jobs-active");
 
+  // 工作台隔离：GPT 任务只在 GPT 工作台展示，注册控制台保持空闲态
+  if (job && job.kind === "gpt_register") {
+    statusEl.className = "pill idle";
+    statusEl.textContent = "空闲（GPT 任务见 GPT 工作台）";
+    idleEl.hidden = false;
+    detailEl.hidden = true;
+    stopBtn.disabled = true;
+    return;
+  }
+
   if (!job) {
     state.activeJobId = null;
     state.activeJobStarted = "";
@@ -625,6 +635,12 @@ function renderActiveJob(job) {
   detailEl.hidden = false;
   $("#active-job-id").textContent = job.id;
   $("#active-job-kind").textContent = kindText[job.kind] || job.kind;
+  const srcChip = $("#active-job-source");
+  const source = String(job.options?.source || "");
+  if (srcChip) {
+    srcChip.hidden = !source;
+    srcChip.textContent = source === "cpa_pool_auto_refill" ? "号池自动补号" : source;
+  }
   $("#active-job-elapsed").textContent = fmtElapsed(state.activeJobStarted);
 
   const s = job.stats || {};
@@ -738,10 +754,10 @@ function renderGptJob(job) {
   const isGpt = job && job.kind === "gpt_register";
   if (!isGpt) {
     statusEl.className = "pill idle";
-    statusEl.textContent = job ? `其他任务：${kindText[job.kind] || job.kind}` : "空闲";
+    statusEl.textContent = job ? `空闲（${kindText[job.kind] || job.kind} 见注册控制台）` : "空闲";
     idleEl.hidden = false;
     detailEl.hidden = true;
-    stopBtn.disabled = !(job && (job.status === "running" || job.status === "queued"));
+    stopBtn.disabled = true;
     renderGptPipeline(null);
     return;
   }
@@ -780,11 +796,13 @@ function classifyLog(line) {
   return "";
 }
 
-function appendLogs(lines) {
+function appendLogs(lines, channel) {
   if (!lines || !lines.length) return;
+  // 日志分流：gpt_register 任务只进 GPT 工作台日志区，其余进注册控制台
+  const wantGpt = channel ? channel === "gpt" : state.activeJobKind === "gpt_register";
   const panels = [
-    { panel: $("#live-log"), autoscroll: $("#log-autoscroll") },
-    { panel: $("#gpt-live-log"), autoscroll: $("#gpt-log-autoscroll") },
+    { panel: wantGpt ? null : $("#live-log"), autoscroll: $("#log-autoscroll") },
+    { panel: wantGpt ? $("#gpt-live-log") : null, autoscroll: $("#gpt-log-autoscroll") },
   ].filter((x) => x.panel);
   for (const { panel, autoscroll } of panels) {
     const placeholder = panel.querySelector(".log-line.dim");
@@ -810,10 +828,12 @@ function appendLogs(lines) {
   state.logCount = ($("#live-log")?.children.length || 0);
 }
 
-function resetLogs(msg = "// 等待任务启动，日志将实时输出在这里") {
+function resetLogs(msg = "// 等待任务启动，日志将实时输出在这里", channel) {
   state.logCount = 1;
-  $("#live-log").innerHTML = `<div class="log-line dim">${esc(msg)}</div>`;
-  if ($("#gpt-live-log")) {
+  if (channel !== "gpt") {
+    $("#live-log").innerHTML = `<div class="log-line dim">${esc(msg)}</div>`;
+  }
+  if (channel !== "grok" && $("#gpt-live-log")) {
     $("#gpt-live-log").innerHTML = `<div class="log-line dim">${esc(msg)}</div>`;
   }
 }
@@ -2338,7 +2358,7 @@ function renderJobs() {
         <span class="job-title">${esc(kindText[job.kind] || job.kind)}</span>
         <span class="pill ${esc(job.status)}">${esc(statusText[job.status] || job.status)}</span>
       </div>
-      <div class="job-meta"><span>${esc(job.id)}</span><span>${esc(job.created_at || "")}</span></div>
+      <div class="job-meta"><span>${esc(job.id)}${job.options?.source ? ` · ${esc(job.options.source === "cpa_pool_auto_refill" ? "号池自动补号" : job.options.source)}` : ""}</span><span>${esc(job.created_at || "")}</span></div>
       <div class="job-counts">
         ${job.kind === "register"
           ? `<span>成功 ${s.reg_success || 0}</span><span>失败 ${s.reg_fail || 0}</span><span>mint ${s.mint_success || 0}</span>`
@@ -2384,8 +2404,12 @@ async function pollActiveJob() {
     const detailJobId = state.activeJobId || previousActiveId;
     if (!detailJobId) return;
     const detail = await api(`/api/jobs/${detailJobId}?after=${state.logCursor}`);
+    state.activeJobKind = detail.kind || "";
     renderActiveJob(detail);
-    if (detail.logs && detail.logs.length) appendLogs(detail.logs);
+    renderGptJob(detail);
+    if (detail.logs && detail.logs.length) {
+      appendLogs(detail.logs, detail.kind === "gpt_register" ? "gpt" : "grok");
+    }
     state.logCursor = detail.log_seq || state.logCursor;
     if (["completed", "failed", "stopped"].includes(detail.status)) {
       if (state.view === "accounts") loadAccounts().catch(() => {});
@@ -2428,7 +2452,7 @@ async function startRegister() {
     const job = await api(url, { method: "POST", body: JSON.stringify(body) });
     state.activeJobId = job.id;
     state.logCursor = 0;
-    resetLogs("// 任务已创建，正在初始化…");
+    resetLogs("// 任务已创建，正在初始化…", "grok");
     appendLogs([`任务已创建: ${job.id}`]);
     renderActiveJob(job);
     toast("注册任务已启动");
@@ -2465,7 +2489,7 @@ async function startGptRegister() {
     state.activeJobId = job.id;
     state.activeJobStarted = job.started_at || "";
     state.logCursor = 0;
-    resetLogs("// GPT 工作流任务已创建，正在输出 HAR 流程预检…");
+    resetLogs("// GPT 工作流任务已创建…", "gpt");
     appendLogs([`GPT 工作流任务已创建: ${job.id}`]);
     renderActiveJob(job);
     renderGptJob(job);
@@ -2492,7 +2516,7 @@ async function startBackfill(payload, notice) {
     const job = await api("/api/jobs/backfill", { method: "POST", body: JSON.stringify(payload) });
     state.activeJobId = job.id;
     state.logCursor = 0;
-    resetLogs("// 补 mint 任务已创建…");
+    resetLogs("// 补 mint 任务已创建…", "grok");
     appendLogs([`${notice}: ${job.id}`]);
     renderActiveJob(job);
     toast("补 CPA 任务已启动");
@@ -3340,7 +3364,7 @@ function bindEvents() {
     if (focus) {
       state.activeJobId = focus.dataset.focusJob;
       state.logCursor = 0;
-      resetLogs("// 加载历史任务日志…");
+      resetLogs("// 加载历史任务日志…", "grok");
       setView("console");
       openJobs(false);
       pollActiveJob();
