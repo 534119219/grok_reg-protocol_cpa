@@ -15,6 +15,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import unquote
 
 from curl_cffi import requests as creq
 
@@ -85,6 +86,20 @@ def _gen_ed25519_keypair() -> tuple[str, str]:
     return private_key_b64, public_key_ssh
 
 
+def _decode_auth_error_redirect(resp) -> str:
+    """auth.openai.com 业务失败时 302 → /error?payload=<base64 json>。
+    解出 errorCode（如 agent_registry_not_enabled），解不出返回空串。"""
+    location = str(resp.headers.get("location") or "")
+    if "payload=" not in location:
+        return ""
+    try:
+        payload = unquote(location.split("payload=", 1)[1].split("&")[0])
+        payload += "=" * (-len(payload) % 4)
+        return str(json.loads(base64.urlsafe_b64decode(payload)).get("errorCode") or "")
+    except Exception:
+        return ""
+
+
 def create_agent_identity(
     access_token: str,
     *,
@@ -129,11 +144,24 @@ def create_agent_identity(
             },
             "agent_public_key": public_key_ssh,
         },
+        allow_redirects=False,
         **kwargs,
     )
+    if r.status_code in (301, 302, 303, 307, 308):
+        err_code = _decode_auth_error_redirect(r)
+        if err_code == "agent_registry_not_enabled":
+            raise RuntimeError(
+                "agent_registry_not_enabled: OpenAI 已对该账号关闭 agent 注册"
+                "（2026-07-23 起全量灰度，旧账号同样被拒）"
+            )
+        raise RuntimeError(f"agent register 被重定向到错误页（{err_code or 'unknown'}）")
     if r.status_code != 200:
         raise RuntimeError(f"agent register HTTP {r.status_code}: {r.text[:200]}")
-    agent_runtime_id = r.json().get("agent_runtime_id")
+    try:
+        body = r.json()
+    except Exception as exc:
+        raise RuntimeError(f"agent register 返回非 JSON: {r.text[:200]}") from exc
+    agent_runtime_id = body.get("agent_runtime_id")
     if not agent_runtime_id:
         raise RuntimeError(f"agent register 未返回 agent_runtime_id: {r.text[:200]}")
     log(f"[*] agent 已注册: {agent_runtime_id}")
